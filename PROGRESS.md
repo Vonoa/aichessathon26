@@ -12,8 +12,10 @@ definitions live in [docs/PLAN.md](docs/PLAN.md).
   (+19 =73 -8 — the draw flood is two thin-eval engines with no plan, an evaluation
   signal, not a bug). Zero `flag` / `crash` / `illegal` / `init` across 140 games.
 - **Tests:** 11 passing, run by `make gate` (ruff + mypy strict + pytest + 2 games).
-- **In flight:** PR `tests-and-gate` (test suite + gate wiring) awaiting merge.
-- **Next:** Phase 3 — the numba-jitted bitboard move generator.
+  `tests-and-gate` merged (PR #3).
+- **In flight:** branch `phase-3-speed` — profiling bench (step 3a).
+- **Next:** Phase 3 continues — transposition table (3b), numba eval (3c), incremental
+  eval (3d), jitted bitboard move generator (3e).
 
 ## Branches / versions
 
@@ -75,3 +77,22 @@ definitions live in [docs/PLAN.md](docs/PLAN.md).
   within-budget / did-search assertion (guards Phase 3 against numba compiling on the
   clock).
 - `pytest` added to the dev group; `make gate` now runs it. 11 tests, ~0.8 s.
+
+### 2026-09-06 — Phase 3 started: profiling (branch `phase-3-speed`)
+
+- `tools/bench.py` (`make bench`): runs the search on three fixed positions (open
+  middlegame, sharp middlegame, rook endgame) and prints depth / nodes / nodes-per-second.
+  `search._last_depth` added as an observability global.
+- **Baseline (pure Python, one core):**
+
+  | position | depth | nodes | nodes/sec |
+  |---|---|---|---|
+  | open middlegame | 4 | 34,425 | 23,432 |
+  | sharp middlegame | 4 | 36,720 | 23,247 |
+  | rook endgame | 6 | 44,625 | 36,341 |
+  | overall | | 115,770 | 27,070 |
+
+  Depth 4 in a middlegame is the ceiling right now — the target for Phase 3 is depth 6-7.
+- Plan for the rest of Phase 3: 3b transposition table, 3c numba-jitted evaluation
+  (warmed at import), 3d incremental eval on push/pop, 3e jitted bitboard move generator
+  (its own multi-PR sub-project, done last).

@@ -23,6 +23,7 @@ _MAX_DEPTH = 64
 _DEBUG = os.environ.get("AGENT_DEBUG") == "1"
 
 _nodes = 0
+_last_depth = 0  # deepest fully completed pass of the last search; read by tools/bench.py
 _seen: frozenset[Hashable] = frozenset()
 
 
@@ -38,8 +39,9 @@ def search_move(
     Iterative deepening: each pass keeps the best move from the last *completed* depth,
     so whenever the budget runs out there is always a finished answer to return.
     """
-    global _nodes, _seen
+    global _nodes, _seen, _last_depth
     _nodes = 0
+    _last_depth = 0
     _seen = frozenset(history) if history else frozenset()
 
     legal = list(board.legal_moves)
@@ -57,6 +59,7 @@ def search_move(
         except _Timeout:
             break
         best = move
+        _last_depth = depth
         if _DEBUG:
             elapsed = (time.monotonic() - started) * 1000.0
             print(f"depth {depth:2d}  score {score:+7d}  nodes {_nodes:>9d}  {elapsed:6.0f} ms")
