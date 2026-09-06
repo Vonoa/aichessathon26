@@ -1,9 +1,10 @@
-"""Negamax with alpha-beta, iterative deepening, and a per-move time budget.
+"""Negamax with alpha-beta, iterative deepening, a transposition table, and a time budget.
 
-Phase 2: mate scores are relative to the root ply, draws (repetition, 50-move,
-insufficient material) are detected inside the search using the game history passed in
-from agent.py, and AGENT_DEBUG=1 prints a line per completed depth. Phase 3 replaces the
-python-chess move loop with a jitted generator. Phase 4 adds the pruning stack.
+Phase 3b adds the transposition table: a search result is cached by position, so a
+position reached by a different move order is not re-searched, and the best move from the
+last iteration is tried first on the next. The table is cleared each move for now; Phase 4
+makes it persistent and fixed-size and adds the rest of the pruning stack. Phase 3e
+replaces the python-chess move loop with a jitted generator.
 """
 
 import os
@@ -20,11 +21,15 @@ _SAFETY_MS = 300
 _CHECK_INTERVAL = 255  # test the wall clock once per this many nodes
 _MAX_DEPTH = 64
 
+_EXACT, _LOWER, _UPPER = 0, 1, 2  # transposition-table bound kinds
+_TT_MAX = 1_000_000  # entries; clear rather than grow past this
+
 _DEBUG = os.environ.get("AGENT_DEBUG") == "1"
 
 _nodes = 0
 _last_depth = 0  # deepest fully completed pass of the last search; read by tools/bench.py
 _seen: frozenset[Hashable] = frozenset()
+_tt: dict[Hashable, tuple[int, int, int, chess.Move | None]] = {}
 
 
 class _Timeout(Exception):
@@ -37,12 +42,14 @@ def search_move(
     """Search the position and return the best move found, in UCI notation.
 
     Iterative deepening: each pass keeps the best move from the last *completed* depth,
-    so whenever the budget runs out there is always a finished answer to return.
+    so whenever the budget runs out there is always a finished answer to return, and that
+    move is tried first on the next, deeper pass.
     """
     global _nodes, _seen, _last_depth
     _nodes = 0
     _last_depth = 0
     _seen = frozenset(history) if history else frozenset()
+    _tt.clear()
 
     legal = list(board.legal_moves)
     if not legal:
@@ -55,7 +62,7 @@ def search_move(
     best = legal[0]
     for depth in range(1, _MAX_DEPTH + 1):
         try:
-            move, score = _search_root(board, depth, deadline)
+            move, score = _search_root(board, depth, deadline, best)
         except _Timeout:
             break
         best = move
@@ -78,11 +85,18 @@ def _budget_s(board: chess.Board, time_left_ms: int) -> float:
     return max(capped, 10.0) / 1000.0
 
 
-def _search_root(board: chess.Board, depth: int, deadline: float) -> tuple[chess.Move, int]:
-    best_move = next(iter(board.legal_moves))
+def _search_root(
+    board: chess.Board, depth: int, deadline: float, first: chess.Move
+) -> tuple[chess.Move, int]:
+    moves = _ordered(board, list(board.legal_moves))
+    if first in moves:
+        moves.remove(first)
+        moves.insert(0, first)
+
+    best_move = moves[0]
     best_score = -MATE - 1
     alpha = -MATE - 1
-    for move in _ordered(board, list(board.legal_moves)):
+    for move in moves:
         board.push(move)
         score = -_negamax(board, depth - 1, 1, -MATE - 1, -alpha, deadline)
         board.pop()
@@ -101,23 +115,58 @@ def _negamax(
         return 0
     if chess.popcount(board.occupied) <= 4 and board.is_insufficient_material():
         return 0
-    if board.halfmove_clock >= 4 and (
-        board.is_repetition(2) or board._transposition_key() in _seen
-    ):
-        return 0
+
     moves = list(board.legal_moves)
     if not moves:
         return -MATE + ply if board.is_check() else 0
     if depth <= 0:
-        return evaluate(board)
+        return evaluate(board)  # leaf: skip the transposition key and table entirely
+
+    key = board._transposition_key()
+    if board.halfmove_clock >= 4 and (board.is_repetition(2) or key in _seen):
+        return 0
+
+    tt_move: chess.Move | None = None
+    entry = _tt.get(key)
+    if entry is not None:
+        e_depth, e_value, e_flag, tt_move = entry
+        if e_depth >= depth:
+            if e_flag == _EXACT:
+                return e_value
+            if e_flag == _LOWER and e_value >= beta:
+                return e_value
+            if e_flag == _UPPER and e_value <= alpha:
+                return e_value
+
+    ordered = _ordered(board, moves)
+    if tt_move is not None and tt_move in ordered:
+        ordered.remove(tt_move)
+        ordered.insert(0, tt_move)
+
+    alpha_orig = alpha
     value = -MATE - 1
-    for move in _ordered(board, moves):
+    best_move: chess.Move | None = None
+    for move in ordered:
         board.push(move)
-        value = max(value, -_negamax(board, depth - 1, ply + 1, -beta, -alpha, deadline))
+        score = -_negamax(board, depth - 1, ply + 1, -beta, -alpha, deadline)
         board.pop()
+        if score > value:
+            value = score
+            best_move = move
         alpha = max(alpha, value)
         if alpha >= beta:
             break
+
+    if abs(value) < _MATE_THRESHOLD:  # our mate scores are root-relative, so path-dependent
+        if value <= alpha_orig:
+            flag = _UPPER
+        elif value >= beta:
+            flag = _LOWER
+        else:
+            flag = _EXACT
+        if len(_tt) >= _TT_MAX:
+            _tt.clear()
+        _tt[key] = (depth, value, flag, best_move)
     return value
 
 
