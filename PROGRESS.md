@@ -1,0 +1,77 @@
+# Progress log
+
+Running record of what's been done. Newest entry at the bottom. The plan and phase
+definitions live in [docs/PLAN.md](docs/PLAN.md).
+
+## Current status (2026-09-06)
+
+- **Engine:** Phase 2 complete and merged to `main`. Negamax + alpha-beta + iterative
+  deepening, MVV-LVA ordering, material + pawn-PST evaluation, mate-distance scoring,
+  draw/repetition awareness driven by game history, per-move time budget.
+- **Strength:** 100% vs `baselines/greedy` (40/40), 55.5% vs the frozen Phase 1
+  (+19 =73 -8 — the draw flood is two thin-eval engines with no plan, an evaluation
+  signal, not a bug). Zero `flag` / `crash` / `illegal` / `init` across 140 games.
+- **Tests:** 11 passing, run by `make gate` (ruff + mypy strict + pytest + 2 games).
+- **In flight:** PR `tests-and-gate` (test suite + gate wiring) awaiting merge.
+- **Next:** Phase 3 — the numba-jitted bitboard move generator.
+
+## Branches / versions
+
+- `main` — Phase 2 engine.
+- `versions/phase1/`, `versions/phase2/` — frozen agents, used as arena opponents.
+- Baselines: `random` < `greedy` (1-ply material) < `minimax` (2-ply) < `numba`.
+
+## Log
+
+### 2026-09-06 — Repo setup
+
+- Split the single `agent.py` into `agent.py` (entrypoint + non-raising fallback),
+  `search.py`, `evaluate.py`. Packager zips all root `*.py`, so this still submits fine.
+- Team repo created at `github.com/Vonoa/aichessathon` (private). Starter kept as the
+  `upstream` remote for pulling harness fixes. `main` protected — changes go via PR + CI.
+- Wrote [docs/PLAN.md](docs/PLAN.md): phased plan, priority order (robustness -> speed ->
+  pruning -> evaluation), competitive read, leakage checklist, performance rules,
+  working agreement.
+
+### 2026-09-06 — Phase 1: minimal working engine (merged, PR #1)
+
+- `search.py`: negamax with fail-soft alpha-beta, iterative deepening keeping the last
+  completed depth, MVV-LVA capture ordering, time budget = `time_left_ms / max(20,
+  50 - fullmove)` capped at `clock - 300 ms`, node-counted clock checks.
+- `evaluate.py`: material (P/N/B/R/Q = 100/320/330/500/900) + a pawn piece-square table,
+  returned from the side-to-move's point of view for negamax.
+- Result: **+31 =9 -0, 88.8% vs greedy.** No crashes or flags. The 9 draws were won
+  games shuffled into a threefold repetition — the Phase 2 target.
+- Frozen to `versions/phase1/`.
+
+### 2026-09-06 — Audit
+
+- [audit.md](audit.md): full read of the Phase 1 code. Confirmed the structure is sound
+  and found the real gaps — no mate-distance scoring, no repetition/draw awareness,
+  terminal-root re-raises through the fallback, MVV-LVA breaks for a king attacker, no
+  tests. All folded into the Phase 2 work below.
+
+### 2026-09-06 — Phase 2: robustness + draws (merged, PR #2)
+
+- **Mate distance:** `_negamax` threads a ply counter and returns `-MATE + ply`, so the
+  engine goes for the fastest mate and the longest defence; the search stops deepening
+  once a forced mate is found.
+- **Draw awareness:** `agent.py` accumulates `_history` (transposition keys of every
+  position we've moved in this game). `_negamax` returns 0 for the 50-move rule,
+  insufficient material, an in-search repetition, or reaching a position already seen in
+  the game. This is what stops won games leaking to a draw.
+- **Edge cases:** safe terminal root (no `StopIteration`), single-legal-move
+  short-circuit, king-attacker MVV-LVA fix (piece-type ordinals, not centipawns),
+  queen promotions ordered ahead of quiets, tighter clock check (every 255 nodes),
+  `AGENT_DEBUG=1` prints depth/score/nodes/ms.
+- Result: **100% vs greedy** (all 40 by checkmate — repetition draws gone), **55.5% vs
+  Phase 1.** Zero self-inflicted losses.
+- Frozen to `versions/phase2/`.
+
+### 2026-09-06 — Test suite (PR `tests-and-gate`)
+
+- `tests/test_engine.py`: mate-in-1 found, single-legal-move short-circuit, promotion
+  UCI, six tricky FENs each return a legal move, determinism, and a move-1
+  within-budget / did-search assertion (guards Phase 3 against numba compiling on the
+  clock).
+- `pytest` added to the dev group; `make gate` now runs it. 11 tests, ~0.8 s.
