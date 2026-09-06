@@ -10,6 +10,10 @@ Phase 4a adds quiescence search: at the horizon, keep searching captures (and ch
 evasions) until the position is quiet before calling evaluate(), so the score is never
 read in the middle of an exchange.
 
+Phase 4b adds killer moves and a history heuristic: a quiet move that caused a beta
+cutoff is tried early in sibling nodes (killer, per ply) and its from/to square pair
+accrues a score that ranks the remaining quiet moves. Both reset each move.
+
 The engine is deterministic by construction: no RNG is imported, move ordering is a
 stable sort over python-chess's fixed generation order, and ties are broken by first-seen.
 The same position and clock always produce the same move.
@@ -33,12 +37,21 @@ _QS_MAX_PLY = _MAX_DEPTH + 32  # hard cap on quiescence recursion, a safety net
 _EXACT, _LOWER, _UPPER = 0, 1, 2  # transposition-table bound kinds
 _TT_MAX = 1_000_000  # entries; clear rather than grow past this
 
+# Move-ordering score bands: captures and promotions on top, then the two killer slots
+# for this ply, then quiet moves ranked by the history heuristic (well below these).
+_CAPTURE_BASE = 10_000_000
+_KILLER_0 = 9_000_000
+_KILLER_1 = 8_000_000
+_KILLER_SLOTS = (_MAX_DEPTH + 1) * 2
+
 _DEBUG = os.environ.get("AGENT_DEBUG") == "1"
 
 _nodes = 0
 _last_depth = 0  # deepest fully completed pass of the last search; read by tools/bench.py
 _seen: frozenset[Hashable] = frozenset()
 _tt: dict[Hashable, tuple[int, int, int, chess.Move | None]] = {}
+_killers: list[chess.Move | None] = [None] * _KILLER_SLOTS  # two per ply, flat: ply*2, ply*2+1
+_hist: list[int] = [0] * 4096  # quiet-move cutoff counts, indexed from_square*64 + to_square
 
 
 class _Timeout(Exception):
@@ -62,6 +75,8 @@ def search_move(
     _last_depth = 0
     _seen = frozenset(history) if history else frozenset()
     _tt.clear()
+    _killers[:] = [None] * _KILLER_SLOTS
+    _hist[:] = [0] * 4096
 
     legal = list(board.legal_moves)
     if not legal:
@@ -160,7 +175,7 @@ def _negamax(
             if e_flag == _UPPER and e_value <= alpha:
                 return e_value
 
-    ordered = _ordered(board, moves)
+    ordered = _ordered(board, moves, ply)
     if tt_move is not None and tt_move in ordered:
         ordered.remove(tt_move)
         ordered.insert(0, tt_move)
@@ -177,6 +192,8 @@ def _negamax(
             best_move = move
         alpha = max(alpha, value)
         if alpha >= beta:
+            if not board.is_capture(move) and move.promotion is None:
+                _record_cutoff(move, ply, depth)
             break
 
     # Do not cache mate scores: ours are measured from the root, so they are wrong down a
@@ -232,20 +249,45 @@ def _qsearch(board: chess.Board, ply: int, alpha: int, beta: int, deadline: floa
     return best
 
 
-def _ordered(board: chess.Board, moves: list[chess.Move]) -> list[chess.Move]:
-    """Best-first: captures by MVV-LVA on piece-type ordinals, then queen promotions."""
+def _ordered(board: chess.Board, moves: list[chess.Move], ply: int = -1) -> list[chess.Move]:
+    """Best-first: captures/promotions by MVV-LVA, then this ply's killer moves, then quiet
+    moves by history score. The caller places any transposition-table move ahead of all.
+    """
+    base = ply * 2
+    if 0 <= base < _KILLER_SLOTS - 1:
+        killer0, killer1 = _killers[base], _killers[base + 1]
+    else:
+        killer0 = killer1 = None
 
     def score(move: chess.Move) -> int:
-        value = 0
         if board.is_capture(move):
             victim = board.piece_type_at(move.to_square) or chess.PAWN
             attacker = board.piece_type_at(move.from_square) or chess.PAWN
-            value = 8 * victim - attacker
+            promo = 0
+            if move.promotion == chess.QUEEN:
+                promo = 100
+            elif move.promotion is not None:
+                promo = 10
+            return _CAPTURE_BASE + 8 * victim - attacker + promo
         if move.promotion is not None:
-            value += 100 if move.promotion == chess.QUEEN else 10
-        return value
+            return _CAPTURE_BASE + (100 if move.promotion == chess.QUEEN else 10)
+        if move == killer0:
+            return _KILLER_0
+        if move == killer1:
+            return _KILLER_1
+        return _hist[move.from_square * 64 + move.to_square]
 
     return sorted(moves, key=score, reverse=True)
+
+
+def _record_cutoff(move: chess.Move, ply: int, depth: int) -> None:
+    """A quiet move caused a beta cutoff: remember it as a killer for this ply and add to
+    its history score, weighted by depth so deep cutoffs count for more."""
+    base = ply * 2
+    if 0 <= base < _KILLER_SLOTS - 1 and _killers[base] != move:
+        _killers[base + 1] = _killers[base]
+        _killers[base] = move
+    _hist[move.from_square * 64 + move.to_square] += depth * depth
 
 
 def _tick(deadline: float) -> None:
