@@ -5,10 +5,10 @@ definitions live in [docs/PLAN.md](docs/PLAN.md).
 
 ## Current status (2026-09-06)
 
-- **Engine:** Phase 4a merged to `main`. Negamax + alpha-beta + iterative deepening,
-  transposition table (per move) + previous-iteration move first, MVV-LVA ordering,
-  quiescence search at the horizon, bitboard material + pawn-PST eval, mate-distance
-  scoring, history-driven draw awareness, increment-aware time budget.
+- **Engine:** Phase 4b merged to `main`. Negamax + alpha-beta + iterative deepening,
+  transposition table (per move) + previous-iteration move first, MVV-LVA + killers +
+  history ordering, quiescence search at the horizon, bitboard material + pawn-PST eval,
+  mate-distance scoring, history-driven draw awareness, increment-aware time budget.
 - **Strength:** each frozen step beats the last decisively — 3b 83.8% vs 2, 3c 67.5% vs
   3b, 4a 100% vs 3c. Beats every baseline (97.5% vs minimax, 87.5% vs numba). Won its
   first rated game. Zero self-inflicted losses throughout.
@@ -18,10 +18,10 @@ definitions live in [docs/PLAN.md](docs/PLAN.md).
 - **Reordered:** the engine already beats every baseline (97.5% vs minimax, 87.5% vs
   numba), so Phase 4 (pruning stack) and Phase 5 (real eval) come before the big, risky
   3e jitted move generator. "Get it right, then get it fast."
-- **In flight:** branch `phase-4-ordering` — killer moves + history heuristic (Phase 4b).
-- **Next Phase 4:** null-move pruning, LMR, PVS, persistent TT. Then Phase 5 (real eval),
-  starting with a KX-vs-K mate driver — the first rated game took ~80 moves to convert a
-  won position.
+- **In flight:** branch `budget-longgame` — `_budget_s` reworked to survive long games.
+- **Next:** Phase 5 (real evaluation). Pruning-stack items (null-move, LMR, PVS, persistent
+  TT) come *after* Phase 5, when a real eval makes games decisive enough to measure and
+  4b's gain can be validated properly.
 
 ## Branches / versions
 
@@ -192,3 +192,15 @@ definitions live in [docs/PLAN.md](docs/PLAN.md).
   1 > quiet moves by history. The TT move is still forced to the front by the caller.
   `_qsearch` and `_search_root` pass no ply, so they keep pure capture ordering.
 - Test: `_record_cutoff` updates the killer slot and adds `depth*depth` to history.
+
+### 2026-09-06 — Budget: survive long games (branch `budget-longgame`)
+
+- `_budget_s`: `moves_left` floor raised 20 -> 30 and the horizon to `56 - fullmove`, the
+  increment share cut 0.8 -> 0.5, plus two hard caps: never more than a third of the clock
+  on one move, and always keep `_RESERVE_MS` (300 -> 500 ms) on the clock. The old formula
+  converged to a ~2 s clock in a long game; this converges near 7-8 s at the real 500 ms
+  increment. First rated game ended with 4.5 s to the opponent's 21 s - this is the fix.
+- Also captured a quick audit's deferred findings in `audit.md`: qsearch stalemate
+  blindness (folds into 5b), qsearch has no delta pruning (with the pruning stack), dirty
+  board after `_Timeout` (latent), TT path-dependent draw (persistent-TT step), history
+  cap (after 3e), and that Phase 4b's gain is unproven on 20-game samples.

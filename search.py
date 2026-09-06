@@ -29,7 +29,7 @@ from evaluate import evaluate
 
 MATE = 1_000_000
 _MATE_THRESHOLD = MATE - 1_000  # a score past this is a forced mate
-_SAFETY_MS = 300
+_RESERVE_MS = 500  # keep at least this on the clock; the watchdog does not forgive
 _CHECK_INTERVAL = 255  # test the wall clock once per this many nodes
 _MAX_DEPTH = 64
 _QS_MAX_PLY = _MAX_DEPTH + 32  # hard cap on quiescence recursion, a safety net
@@ -107,13 +107,14 @@ def search_move(
 def _budget_s(board: chess.Board, time_left_ms: int, increment_ms: float) -> float:
     """Time to spend on this move, in seconds.
 
-    A share of the remaining clock plus most of the increment: every move we make refills
-    the clock by the increment, so it is ours to spend rather than to hoard. Capped below
-    the clock minus a watchdog margin, floored at 10 ms so we always search something.
+    A sustainable share of the clock plus half the increment (each move refills the clock
+    by the increment, so it is time to spend, not hoard). Assume the game still has a fair
+    number of moves left - never divide by fewer than 30 - then never commit more than a
+    third of the clock to one move and always leave a reserve. Floored at 10 ms.
     """
-    moves_left = max(20, 50 - board.fullmove_number)
-    budget_ms = time_left_ms / moves_left + 0.8 * increment_ms
-    budget_ms = min(budget_ms, float(time_left_ms - _SAFETY_MS))
+    moves_left = max(30, 56 - board.fullmove_number)
+    budget_ms = time_left_ms / moves_left + 0.5 * increment_ms
+    budget_ms = min(budget_ms, time_left_ms / 3.0, float(time_left_ms - _RESERVE_MS))
     return max(budget_ms, 10.0) / 1000.0
 
 
