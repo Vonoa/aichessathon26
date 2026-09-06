@@ -22,7 +22,11 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [dependency-groups]
-dev = ["mypy>=1.18", "ruff>=0.14"]
+dev = ["mypy>=1.18", "ruff>=0.14", "pytest>=8"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
