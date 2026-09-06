@@ -119,13 +119,18 @@ def _negamax(
     moves = list(board.legal_moves)
     if not moves:
         return -MATE + ply if board.is_check() else 0
-    if depth <= 0:
-        return evaluate(board)  # leaf: skip the transposition key and table entirely
 
-    key = board._transposition_key()
-    if board.halfmove_clock >= 4 and (board.is_repetition(2) or key in _seen):
+    # A repetition or an already-seen position is a draw even when it lands exactly on the
+    # horizon, so this must run before the depth<=0 leaf return. The key is only computed
+    # once halfmove_clock makes a repetition possible, so quiet leaves still skip it.
+    key = board._transposition_key() if board.halfmove_clock >= 4 else None
+    if key is not None and (board.is_repetition(2) or key in _seen):
         return 0
+    if depth <= 0:
+        return evaluate(board)
 
+    if key is None:
+        key = board._transposition_key()
     tt_move: chess.Move | None = None
     entry = _tt.get(key)
     if entry is not None:
@@ -157,7 +162,10 @@ def _negamax(
         if alpha >= beta:
             break
 
-    if abs(value) < _MATE_THRESHOLD:  # our mate scores are root-relative, so path-dependent
+    # Do not cache mate scores: ours are measured from the root, so they are wrong down a
+    # different path. (A 0 from an in-search repetition is path-dependent too, but harmless
+    # while the table is cleared every move; revisit when the Phase 4 table persists.)
+    if abs(value) < _MATE_THRESHOLD:
         if value <= alpha_orig:
             flag = _UPPER
         elif value >= beta:
