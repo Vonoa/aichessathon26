@@ -13,9 +13,9 @@ definitions live in [docs/PLAN.md](docs/PLAN.md).
   signal, not a bug). Zero `flag` / `crash` / `illegal` / `init` across 140 games.
 - **Tests:** 11 passing, run by `make gate` (ruff + mypy strict + pytest + 2 games).
   `tests-and-gate` merged (PR #3).
-- **In flight:** branch `phase-3-speed` — profiling bench (step 3a).
-- **Next:** Phase 3 continues — transposition table (3b), numba eval (3c), incremental
-  eval (3d), jitted bitboard move generator (3e).
+- **In flight:** branch `phase-3-tt` — transposition table + iterative-deepening move
+  ordering (step 3b). **83.8% vs frozen Phase 2**, 1 draw in 40 games.
+- **Next:** 3c numba-jitted eval, 3d incremental eval, 3e jitted move generator.
 
 ## Branches / versions
 
@@ -96,3 +96,17 @@ definitions live in [docs/PLAN.md](docs/PLAN.md).
 - Plan for the rest of Phase 3: 3b transposition table, 3c numba-jitted evaluation
   (warmed at import), 3d incremental eval on push/pop, 3e jitted bitboard move generator
   (its own multi-PR sub-project, done last).
+
+### 2026-09-06 — Phase 3b: transposition table (branch `phase-3-tt`)
+
+- `_negamax` computes the position key once (leaves skip it entirely), probes `_tt` for a
+  cached result usable at the current depth/window, and stores `(depth, score, bound,
+  best move)` after searching. Bound kind (`_EXACT` / `_LOWER` / `_UPPER`) records whether
+  the score is exact, a floor (beta cutoff), or a ceiling (failed low). Mate scores are
+  not cached — ours are root-relative, so path-dependent. Table cleared each move; Phase 4
+  makes it persistent + fixed-size.
+- `_search_root` now takes the previous iteration's best move and searches it first — the
+  "iterative deepening feeds move ordering" win the audit flagged as missing.
+- Bench barely moved (middlegame still depth 4, ~-5% nodes/sec; endgame depth 6 -> 7).
+  But the arena jumped: **83.8% vs frozen Phase 2 (+33 =1 -6)**, draws down from 73/100
+  to 1/40. The gain is move-ordering quality and plan stability, not raw depth.
