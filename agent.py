@@ -1,5 +1,7 @@
 """The submission entrypoint. The platform imports this file and calls get_move."""
 
+from collections.abc import Hashable
+
 import chess
 
 from search import search_move
@@ -7,6 +9,11 @@ from search import search_move
 # Import time runs once per game, inside a 90 second budget, before your clock starts.
 # Load weights and build tables out here, not inside get_move. Warm every numba-jitted
 # function here too, so compilation lands in the init budget rather than on the clock.
+
+# Every position we have been asked to move in this game, counted. The process is fresh
+# per game so this resets on its own. The search reads it to spot a line that repeats a
+# position the game has already seen and score it as a draw.
+_history: dict[Hashable, int] = {}
 
 
 def get_move(fen: str, time_left_ms: int) -> str:
@@ -22,8 +29,11 @@ def get_move(fen: str, time_left_ms: int) -> str:
     print() is safe: stdout is redirected away from the protocol stream.
     """
     board = chess.Board(fen)
+    key = board._transposition_key()
+    _history[key] = _history.get(key, 0) + 1
     try:
-        return search_move(board, time_left_ms)
+        return search_move(board, time_left_ms, _history)
     except Exception:
         # A bug in the search must never forfeit the game: fall back to any legal move.
-        return next(iter(board.legal_moves)).uci()
+        legal = list(board.legal_moves)
+        return legal[0].uci() if legal else "0000"
