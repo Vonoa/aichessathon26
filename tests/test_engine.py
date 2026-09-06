@@ -9,6 +9,7 @@ import chess
 import pytest
 
 import agent
+import evaluate
 import search
 
 
@@ -82,6 +83,43 @@ def test_budget_stays_sane_across_clocks() -> None:
         for inc in (0.0, 100.0, 500.0):
             secs = search._budget_s(board, clock, inc)
             assert 0.01 <= secs <= clock / 1000.0, f"clock {clock}, inc {inc} -> {secs}s"
+
+
+_VALUES = {
+    chess.PAWN: 100,
+    chess.KNIGHT: 320,
+    chess.BISHOP: 330,
+    chess.ROOK: 500,
+    chess.QUEEN: 900,
+}
+
+
+def _reference_evaluate(board: chess.Board) -> int:
+    """The pre-3c SquareSet implementation, kept here to pin the bitboard rewrite."""
+    pst = evaluate._PAWN_PST
+    score = sum(
+        v * (len(board.pieces(pt, chess.WHITE)) - len(board.pieces(pt, chess.BLACK)))
+        for pt, v in _VALUES.items()
+    )
+    score += sum(pst[sq] for sq in board.pieces(chess.PAWN, chess.WHITE))
+    score -= sum(pst[chess.square_mirror(sq)] for sq in board.pieces(chess.PAWN, chess.BLACK))
+    return score if board.turn == chess.WHITE else -score
+
+
+@pytest.mark.parametrize(
+    "fen",
+    [
+        chess.STARTING_FEN,
+        "r1bq1rk1/pp2bppp/2n1pn2/2pp4/3P1B2/2PBPN2/PP1N1PPP/R2Q1RK1 w - - 0 9",
+        "8/5pk1/6p1/7p/3R3P/6P1/5PK1/3r4 b - - 0 1",
+        "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c6 0 2",
+        "8/PP3kpp/8/8/8/8/pp3KPP/8 b - - 0 1",
+        "8/8/8/8/8/8/8/K6k w - - 0 1",
+    ],
+)
+def test_bitboard_eval_matches_reference(fen: str) -> None:
+    board = chess.Board(fen)
+    assert evaluate.evaluate(board) == _reference_evaluate(board)
 
 
 def test_infers_increment_from_clock_deltas() -> None:

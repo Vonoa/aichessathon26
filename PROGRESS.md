@@ -13,8 +13,9 @@ definitions live in [docs/PLAN.md](docs/PLAN.md).
   60-65% at 3 s + 0.05 s after the leaf-repetition fix. Phase 2 itself: 100% vs
   `baselines/greedy`, 55.5% vs frozen Phase 1. Zero self-inflicted losses throughout.
 - **Tests:** 13 passing, run by `make gate` (ruff + mypy strict + pytest + 2 games).
-- **In flight:** branch `time-management` — increment-aware `_budget_s` + determinism note.
-- **Next:** 3c numba-jitted eval, 3d incremental eval, 3e jitted move generator.
+- **In flight:** branch `phase-3-eval` — bitboard evaluation (3c).
+- **Next:** 3d incremental eval, 3e jitted move generator (the numba work lands here, not
+  in the eval — the bench says the generator is the per-node bottleneck).
 
 ## Branches / versions
 
@@ -136,3 +137,14 @@ definitions live in [docs/PLAN.md](docs/PLAN.md).
   first-seen tie-break). Tests added for `_budget_s` sanity and `_infer_increment`.
 - Carry-overs still open: Phase 2's 300-game clean bar, `_TT_MAX` clear-vs-evict, and the
   persistent-TT path-dependence (deferred to Phase 4 / a longer run).
+
+### 2026-09-06 — Phase 3c: bitboard evaluation (branch `phase-3-eval`)
+
+- `evaluate()` rewritten: material via `int.bit_count()` on masked piece bitboards, pawn
+  table walked by bit iteration (`sq ^ 56` mirrors for Black). No more `board.pieces()`
+  SquareSet allocation - a dozen objects per call gone.
+- Same values as before, so it is a pure speed change. `test_bitboard_eval_matches_reference`
+  pins the new output against the old SquareSet formula across six positions.
+- Decision: the standalone "numba the eval" step is dropped. `baselines/numba` in this
+  repo already shows jitting a small eval is "barely stronger", and the bench says the
+  move generator, not the eval, is the per-node cost. numba goes into 3e.
