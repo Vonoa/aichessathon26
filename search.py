@@ -5,6 +5,10 @@ position reached by a different move order is not re-searched, and the best move
 last iteration is tried first on the next. The table is cleared each move for now; Phase 4
 makes it persistent and fixed-size and adds the rest of the pruning stack. Phase 3e
 replaces the python-chess move loop with a jitted generator.
+
+The engine is deterministic by construction: no RNG is imported, move ordering is a
+stable sort over python-chess's fixed generation order, and ties are broken by first-seen.
+The same position and clock always produce the same move.
 """
 
 import os
@@ -37,7 +41,10 @@ class _Timeout(Exception):
 
 
 def search_move(
-    board: chess.Board, time_left_ms: int, history: dict[Hashable, int] | None = None
+    board: chess.Board,
+    time_left_ms: int,
+    history: dict[Hashable, int] | None = None,
+    increment_ms: float = 0.0,
 ) -> str:
     """Search the position and return the best move found, in UCI notation.
 
@@ -58,7 +65,7 @@ def search_move(
         return legal[0].uci()
 
     started = time.monotonic()
-    deadline = started + _budget_s(board, time_left_ms)
+    deadline = started + _budget_s(board, time_left_ms, increment_ms)
     best = legal[0]
     for depth in range(1, _MAX_DEPTH + 1):
         try:
@@ -77,12 +84,17 @@ def search_move(
     return best.uci()
 
 
-def _budget_s(board: chess.Board, time_left_ms: int) -> float:
-    """Spend a slice of the remaining clock on this move, keeping a watchdog margin."""
+def _budget_s(board: chess.Board, time_left_ms: int, increment_ms: float) -> float:
+    """Time to spend on this move, in seconds.
+
+    A share of the remaining clock plus most of the increment: every move we make refills
+    the clock by the increment, so it is ours to spend rather than to hoard. Capped below
+    the clock minus a watchdog margin, floored at 10 ms so we always search something.
+    """
     moves_left = max(20, 50 - board.fullmove_number)
-    share = time_left_ms / moves_left
-    capped = min(share, float(time_left_ms - _SAFETY_MS))
-    return max(capped, 10.0) / 1000.0
+    budget_ms = time_left_ms / moves_left + 0.8 * increment_ms
+    budget_ms = min(budget_ms, float(time_left_ms - _SAFETY_MS))
+    return max(budget_ms, 10.0) / 1000.0
 
 
 def _search_root(
