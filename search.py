@@ -6,6 +6,10 @@ last iteration is tried first on the next. The table is cleared each move for no
 makes it persistent and fixed-size and adds the rest of the pruning stack. Phase 3e
 replaces the python-chess move loop with a jitted generator.
 
+Phase 4a adds quiescence search: at the horizon, keep searching captures (and check
+evasions) until the position is quiet before calling evaluate(), so the score is never
+read in the middle of an exchange.
+
 The engine is deterministic by construction: no RNG is imported, move ordering is a
 stable sort over python-chess's fixed generation order, and ties are broken by first-seen.
 The same position and clock always produce the same move.
@@ -24,6 +28,7 @@ _MATE_THRESHOLD = MATE - 1_000  # a score past this is a forced mate
 _SAFETY_MS = 300
 _CHECK_INTERVAL = 255  # test the wall clock once per this many nodes
 _MAX_DEPTH = 64
+_QS_MAX_PLY = _MAX_DEPTH + 32  # hard cap on quiescence recursion, a safety net
 
 _EXACT, _LOWER, _UPPER = 0, 1, 2  # transposition-table bound kinds
 _TT_MAX = 1_000_000  # entries; clear rather than grow past this
@@ -139,7 +144,7 @@ def _negamax(
     if key is not None and (board.is_repetition(2) or key in _seen):
         return 0
     if depth <= 0:
-        return evaluate(board)
+        return _qsearch(board, ply, alpha, beta, deadline)
 
     if key is None:
         key = board._transposition_key()
@@ -188,6 +193,43 @@ def _negamax(
             _tt.clear()
         _tt[key] = (depth, value, flag, best_move)
     return value
+
+
+def _qsearch(board: chess.Board, ply: int, alpha: int, beta: int, deadline: float) -> int:
+    """Search only captures (all evasions when in check) until the position is quiet.
+
+    Without this the evaluation is read mid-exchange - "up a queen" one ply before the
+    recapture - and is wrong. The stand-pat score assumes the side to move can hold at
+    least the static eval, which fails only in zugzwang and is a standard trade-off.
+    """
+    _tick(deadline)
+    if ply >= _QS_MAX_PLY:
+        return evaluate(board)
+
+    if board.is_check():
+        moves = list(board.legal_moves)
+        if not moves:
+            return -MATE + ply
+        best = -MATE - 1
+    else:
+        best = evaluate(board)
+        if best >= beta:
+            return best
+        if best > alpha:
+            alpha = best
+        moves = [m for m in board.legal_moves if board.is_capture(m) or m.promotion is not None]
+
+    for move in _ordered(board, moves):
+        board.push(move)
+        score = -_qsearch(board, ply + 1, -beta, -alpha, deadline)
+        board.pop()
+        if score > best:
+            best = score
+        if score > alpha:
+            alpha = score
+        if alpha >= beta:
+            break
+    return best
 
 
 def _ordered(board: chess.Board, moves: list[chess.Move]) -> list[chess.Move]:

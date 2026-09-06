@@ -77,6 +77,21 @@ def test_seen_position_is_a_draw_at_the_horizon() -> None:
     assert at_horizon == 0
 
 
+def test_qsearch_resolves_a_hanging_piece() -> None:
+    # White's rook can take Black's undefended rook. Static eval sees material equal;
+    # quiescence must see the win.
+    board = chess.Board("4k3/8/8/8/8/3r4/3R4/4K3 w - - 0 1")
+    q = search._qsearch(board, 0, -search.MATE, search.MATE, time.monotonic() + 5)
+    assert q >= 450
+    assert q > evaluate.evaluate(board)
+
+
+def test_qsearch_leaves_a_quiet_position_at_the_static_eval() -> None:
+    board = chess.Board("4k3/8/8/8/4P3/8/8/4K3 w - - 0 1")  # nothing to capture, no check
+    q = search._qsearch(board, 0, -search.MATE, search.MATE, time.monotonic() + 5)
+    assert q == evaluate.evaluate(board)
+
+
 def test_budget_stays_sane_across_clocks() -> None:
     board = chess.Board()
     for clock in (150, 1_000, 8_000, 60_000, 120_000):

@@ -13,9 +13,13 @@ definitions live in [docs/PLAN.md](docs/PLAN.md).
   60-65% at 3 s + 0.05 s after the leaf-repetition fix. Phase 2 itself: 100% vs
   `baselines/greedy`, 55.5% vs frozen Phase 1. Zero self-inflicted losses throughout.
 - **Tests:** 13 passing, run by `make gate` (ruff + mypy strict + pytest + 2 games).
-- **In flight:** branch `phase-3-eval` — bitboard evaluation (3c).
-- **Next:** 3d incremental eval, 3e jitted move generator (the numba work lands here, not
-  in the eval — the bench says the generator is the per-node bottleneck).
+- **Submitted:** first upload passed validation (ready in 0.5 s, won its smoke game). Live
+  in the hourly rated rounds.
+- **Reordered:** the engine already beats every baseline (97.5% vs minimax, 87.5% vs
+  numba), so Phase 4 (pruning stack) and Phase 5 (real eval) come before the big, risky
+  3e jitted move generator. "Get it right, then get it fast."
+- **In flight:** branch `phase-4-quiescence` — quiescence search (Phase 4a).
+- **Next Phase 4:** killers + history, null-move pruning, LMR, PVS, persistent TT.
 
 ## Branches / versions
 
@@ -148,3 +152,21 @@ definitions live in [docs/PLAN.md](docs/PLAN.md).
 - Decision: the standalone "numba the eval" step is dropped. `baselines/numba` in this
   repo already shows jitting a small eval is "barely stronger", and the bench says the
   move generator, not the eval, is the per-node cost. numba goes into 3e.
+
+### 2026-09-06 — First submission
+
+- `submission.zip` (agent.py, evaluate.py, search.py at the zip root, 12 KB unzipped)
+  passed platform validation: `ready in 0.5 s of the 90 s init budget`, won its first
+  smoke game by checkmate, slowest move 3.2 s. Live in the hourly rated rounds.
+- Smoke game 2 ended `draw by ply_cap` - more evidence the thin eval has no plan in
+  balanced positions and needs Phase 5.
+
+### 2026-09-06 — Phase 4a: quiescence search (branch `phase-4-quiescence`)
+
+- `_negamax` at `depth <= 0` now calls `_qsearch` instead of `evaluate()` directly.
+  `_qsearch` stands pat on the static eval, then searches only captures and promotions
+  (all legal evasions when in check) with alpha-beta until the position is quiet. Ply is
+  hard-capped at `_MAX_DEPTH + 32` as a safety net; `_tick` runs so it respects the clock.
+- Fixes the horizon effect: the eval was being read one ply before a recapture.
+- Tests: `_qsearch` resolves a hanging rook (>= +450, and more than the static eval), and
+  leaves a quiet position exactly at the static eval.
