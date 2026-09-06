@@ -117,6 +117,14 @@ def test_budget_stays_sane_across_clocks() -> None:
             assert 0.01 <= secs <= clock / 1000.0, f"clock {clock}, inc {inc} -> {secs}s"
 
 
+def test_budget_leaves_a_reserve_and_caps_at_a_third() -> None:
+    board = chess.Board()
+    for clock in (700, 2_000, 12_000, 90_000):
+        secs = search._budget_s(board, clock, 500.0)
+        assert secs <= clock / 3000.0 + 1e-9
+        assert secs <= max(0.01, (clock - search._RESERVE_MS) / 1000.0)
+
+
 _VALUES = {
     chess.PAWN: 100,
     chess.KNIGHT: 320,

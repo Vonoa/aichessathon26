@@ -1,368 +1,430 @@
 # Engine audit
 
-**Audits so far (all 2026-09-06):**
-1. Phase 1 skeleton.
-2. Phase 2 (mate distance, draw awareness, edge cases).
-3. Phase 3a (profiling bench — instrumentation only).
-4. **Phase 3b (transposition table + iterative-deepening move ordering) — this document.**
+**Audit history (all 2026-09-06):** Phase 1 skeleton → Phase 2 (mate distance, draw awareness)
+→ Phase 3a (bench) → Phase 3b (transposition table) → **this pass: the full engine through
+Phase 4b.**
 
-**Branch:** `phase-3-tt` (3b committed and frozen to `versions/phase3b/`). **Next:** 3c
-numba-jitted eval. Scope: [`evaluate.py`](evaluate.py), [`search.py`](search.py),
-[`agent.py`](agent.py), [`tools/bench.py`](tools/bench.py); harness context from
-[`harness/referee.py`](harness/referee.py). Findings verified by running the code.
+**Branch:** `phase-4-ordering` (Phase 4b committed, frozen to `versions/phase4b/`, tree clean).
+**Next:** null-move / LMR / PVS / persistent TT, then Phase 5 (real eval). 3e (jitted move
+generator) is deliberately deferred — see §6.
+
+Scope: [`agent.py`](agent.py), [`search.py`](search.py), [`evaluate.py`](evaluate.py),
+[`tools/bench.py`](tools/bench.py), [`tests/test_engine.py`](tests/test_engine.py); harness
+context from [`harness/referee.py`](harness/referee.py), [`harness/sandbox.py`](harness/sandbox.py).
+Every finding was verified by running the code.
 
 ---
 
 ## 0. Status
 
-| Phase | State |
+| Component | State |
 |---|---|
-| 1 — minimal engine | **Complete** |
-| 2 — robustness + draws | **Complete** — but 3b partially regressed the leaf-level repetition guard (finding 1) |
-| 3a — profiling bench | **Complete** (instrumentation only) |
-| 3b — transposition table | **Mostly complete** — TT is sound, ordering win is real and measured; fix finding 1 before 3c |
+| Phase 1 — minimal engine | **Complete** |
+| Phase 2 — robustness + draws | **Complete** (the 3b leaf-repetition regression was found in review, fixed, and regression-tested) |
+| Phase 3a — bench | **Complete** (instrumentation) |
+| Phase 3b — transposition table | **Complete** — verified sound with qsearch + killers in the mix |
+| Phase 3c — bitboard eval | **Complete** — output pinned against the old formula |
+| Time management — increment-aware budget | **Complete** — with a known long-game weakness (finding 5) |
+| Phase 4a — quiescence search | **Complete** — with stalemate / width caveats (findings 1, 2) |
+| Phase 4b — killers + history | **Complete and clean** |
+| Phase 3e — jitted movegen | **Deferred on purpose** (§6) |
 
-`ruff` + `mypy --strict` clean. 11 tests pass. Arenas (this audit):
+`ruff` + `mypy --strict` clean. **23 tests pass** (~0.8 s). Bench: overall ~40k nps (up from the
+27k Phase 3a baseline), middlegame still **depth 4**, endgame depth 7. `make zip` ships
+`agent.py` + `evaluate.py` + `search.py` only (16 KB unzipped); `tools/` and `tests/` excluded.
+Engine is submitted and live in rated rounds.
 
-| phase-3-tt vs `versions/phase2` | result | draws |
-|---|---|---|
-| 10 s + 0.1 s (arena default) | **+15 =1 -4, 77.5%** | 0 threefold, 1 fifty-move |
-| 3 s + 0.05 s (stress) | +5 =9 -6, 47.5% | **9 threefold / 20** |
-| `phase2` vs `phase2` @ 3 s + 0.05 s (control) | +9 =5 -6, 57.5% | 3 threefold / 20 |
+Arenas this pass (54 games, **zero crash / flag / illegal**):
 
-The 10 s result corroborates PROGRESS's "83.8% vs Phase 2". The 3 s result is finding 1
-biting — see section 4.
+| phase4b vs | TC | result | draws |
+|---|---|---|---|
+| `baselines/minimax` | 10 s + 0.1 s | **+14 =0 −0, 100 %** | 0 |
+| `versions/phase2` | 3 s + 0.05 s | **+17 =1 −2, 87.5 %** | 1 threefold — the low-clock draw guard is healthy again (was 47.5 % / 9 draws before the 3b fix) |
+| `versions/phase4a` | 10 s + 0.1 s | **+2 =12 −6, 40 %** | 10 fifty-move, 2 threefold — see finding 7 |
+
+**No critical issues. No correctness bugs in the main search.** The findings are horizon-effect
+gaps in quiescence, a near-mirror draw flood against the previous version, and a few latent
+traps — details in §4.
 
 ---
 
-## 1. `evaluate.py` (unchanged since Phase 1)
+## 1. `evaluate.py` — bitboard material + pawn PST (Phase 3c)
 
 ### What static evaluation is
 
-A heuristic score for a position computed **without searching**. The search bottoms out at leaf
-nodes and calls `evaluate()` to guess who is better and by how much. All tactical understanding
-comes from the search; the evaluator only needs to be roughly right about quiet positions.
+A heuristic score for a position with **no search** — the leaves of the tree call it to guess
+who is better. All tactics come from the search; the evaluator only needs to be roughly right
+about quiet positions.
 
-### Material values (lines 9-15)
+### The 3c rewrite
 
-`PAWN 100, KNIGHT 320, BISHOP 330, ROOK 500, QUEEN 900`. Lines 33-35: `(white − black) count ×
-value`. Standard Kaufman-ish values; knight ≈ bishop with a slight bishop edge; king has no
-material value (checkmate is handled in the search).
+`evaluate()` used to build a `SquareSet` per piece type via `board.pieces(...)` — ~a dozen
+object allocations per call. It now works straight on the raw bitboards:
 
-### Why centipawns
+```python
+white = board.occupied_co[chess.WHITE]; black = board.occupied_co[chess.BLACK]
+score = _PAWN * ((board.pawns & white).bit_count() - (board.pawns & black).bit_count()) + ...
+```
 
-1 cp = 1/100 pawn. Integer math scaled by 100 avoids float rounding in a function called
-millions of times, leaves room for sub-pawn positional terms, and matches every published table.
-`MATE = 1_000_000` sits far above any realistic material sum, so mate can't be confused with
-material.
+`int.bit_count()` (Python 3.10+; platform is 3.12) is popcount. Pawn PST is walked by bit
+iteration: `wp & -wp` isolates the low bit, `.bit_length() - 1` is its square index,
+`wp &= wp - 1` clears it. Black mirrors with `sq ^ 56` (flip the rank, same as
+`square_mirror`) and is **subtracted**. Same piece values (100/320/330/500/900), same table, so
+**it is a pure speed change** — `test_bitboard_eval_matches_reference` pins the output against
+the old `board.pieces()` formula across six positions; this audit re-checked it on a
+promoted-queen pile (+2700), bare kings, an all-pawns wall, black-to-move, and a black pawn one
+square from promotion — **all match.**
 
-### Pawn piece-square table (lines 18-27)
+### The pawn table (unchanged)
 
-`_PAWN_PST[square]` is a centipawn bonus for a white pawn, indexed `a1..h8`. By rank: rank 2 has
-d2/e2 = −20 (push the centre pawns); rank 4 d4/e4 = +20; rank 5 d5/e5 = +25; rank 7 = +50 across
-(near promotion); ranks 1 & 8 = 0. Classic CPW pawn table.
+Rank 2 d2/e2 = −20 (push the centre pawns → a 40 cp swing for `d4`/`e4`); rank 4 d4/e4 = +20;
+rank 5 = +25; rank 7 = +50 across (near promotion); ranks 1 & 8 = 0. Classic CPW table.
 
-### Why Black's squares are mirrored (line 39)
+### Why centipawns / the side-to-move flip
 
-`chess.square_mirror` flips the rank (a7↔a2, e5↔e4) so a black pawn is scored against the
-positionally-equivalent white square; the result is **subtracted**.
-
-### Why the final flip (line 40)
-
-`return score if board.turn == chess.WHITE else -score`. Everything above is White-relative;
-negamax needs every node scored **relative to the side to move**, so if Black is to move, negate.
-
-### Why side-to-move perspective fits negamax
-
-Negamax has every node maximise its own score and negate the child's. That only works if "score"
-always means "good for whoever is on move." Line 40 makes `evaluate()` speak that convention, so
-the search never needs to know its colour. A leaf returns "good for the player to move at the
-leaf"; each `-_negamax(...)` one ply up flips it; each `board.push` swaps the side — signs stay
-consistent from leaf to root.
+Integers scaled ×100 avoid float rounding in a hot function and match every published table.
+`return score if board.turn == chess.WHITE else -score` — everything above is White-relative;
+negamax needs every node scored **relative to the side to move**, so Black-to-move negates.
 
 ### Understands / cannot understand
 
-**Understands:** material; central vs wing pawns; whether the d/e pawns moved; pawn advancement,
-especially near promotion; symmetrically for both sides.
+**Understands:** material; central vs wing pawns; whether the d/e pawns moved; pawn
+advancement, especially near promotion.
 
-**Cannot understand:** king safety, piece activity/mobility/outposts, non-pawn placement (no PST
-for N/B/R/Q), pawn structure (doubled/isolated/backward/passed beyond raw rank), open files,
-bishop pair as a term, space, tempo, initiative; any tactic beyond search depth; fortresses and
-wrong-bishop draws. `evaluate()` itself ignores the halfmove clock and repetition (the search
-handles those).
-
-### Sensible / fails
-
-**Sensible:** up a rook → +500; 1.e4 (−20→+20) preferred over 1.a3; winning a pawn → +100-ish;
-KQ vs KR → +400.
-
-**Fails:** positional sacrifice one ply past the horizon (declines it); opposite-side-castling
-attack at equal material → 0.00; rim knight vs outpost knight → 0.00; healthy vs doubled
-isolated pawns at equal count → 0.00; grabbing a pawn that wrecks its own king; fortress →
-"+330 winning".
+**Cannot:** king safety, piece activity/mobility/outposts, non-pawn placement (no PST for
+N/B/R/Q), pawn structure beyond raw rank, open files, the bishop pair as a term, space, tempo;
+any tactic beyond search depth; fortresses and wrong-bishop draws; **mating technique** (the
+rated game took ~80 moves to convert a won position — this is the Phase 5 signal).
 
 ---
 
-## 2. `search.py`, function by function (Phase 3b)
+## 2. `search.py` — negamax + AB + ID + TT + quiescence + killers/history
 
-### Module state (lines 18-32)
+### Module state (lines 30-54)
 
-- `MATE = 1_000_000`; `_MATE_THRESHOLD = MATE - 1_000` — any `|score| ≥` this is a forced mate
-  (smallest possible mate magnitude is `MATE - 64`, safely above).
-- `_CHECK_INTERVAL = 255` — wall clock tested every 255 nodes.
-- `_EXACT, _LOWER, _UPPER = 0, 1, 2` — TT bound kinds.
-- `_TT_MAX = 1_000_000` — clear the table rather than grow past this.
-- `_nodes`, `_last_depth` (last fully completed ID depth; read by `tools/bench.py`),
-  `_seen: frozenset` (transposition keys the real game has visited), and
-  `_tt: dict[key -> (depth, value, flag, best_move)]`.
+`MATE = 1_000_000`; `_MATE_THRESHOLD = MATE - 1_000` (any `|score| ≥` this is a forced mate;
+the smallest real mate magnitude is `MATE - 64`, safely above). `_CHECK_INTERVAL = 255` (clock
+tested every 255 nodes). `_QS_MAX_PLY = 96` (quiescence recursion cap). TT bound kinds
+`_EXACT/_LOWER/_UPPER`; `_TT_MAX = 1_000_000`. Move-ordering bands: `_CAPTURE_BASE = 10_000_000`,
+`_KILLER_0 = 9_000_000`, `_KILLER_1 = 8_000_000`, history below. `_killers` (2 slots × 65 plies,
+flat) and `_hist` (4096 from/to counts) — both reset every move.
 
-### `search_move(board, time_left_ms, history=None) -> str` (lines 39-77)
+### `search_move(board, time_left_ms, history=None, increment_ms=0.0) -> str` (lines 61-104)
 
-Resets `_nodes` / `_last_depth`; `_seen = frozenset(history)`; **`_tt.clear()`** (the table is
-per-move for now). Then:
+Resets `_nodes` / `_last_depth`; `_seen = frozenset(history)`; **clears `_tt`, `_killers`,
+`_hist`**. No legal moves → `"0000"`; one → return it. Then iterative deepening `depth = 1..64`:
+`move, score = _search_root(board, depth, deadline, best)` with `best` (the previous iteration's
+move) passed in as the first move to try; `_Timeout` → `break` (keep the previous `best`). After
+a completed depth: `best = move`, `_last_depth = depth`, optional `AGENT_DEBUG` print, `break`
+if `|score| ≥ _MATE_THRESHOLD` (proven mate) or past the deadline.
 
-- no legal moves → `"0000"`; exactly one → return it immediately.
-- iterative deepening `depth = 1..64`: `move, score = _search_root(board, depth, deadline, best)`
-  — **`best` (the previous iteration's move) is passed in as the first move to try.** `_Timeout`
-  → `break` (keep the previous `best`). After a completed depth: `best = move`,
-  `_last_depth = depth`, optional `AGENT_DEBUG` print, `break` if `|score| ≥ _MATE_THRESHOLD`
-  (forced mate — a deeper search can't improve a proven mate) or past the deadline.
+### `_budget_s(board, time_left_ms, increment_ms) -> float` (lines 107-117)
 
-### `_budget_s(board, time_left_ms) -> float` (lines 80-85) — unchanged since Phase 1
+```python
+moves_left = max(20, 50 - board.fullmove_number)
+budget_ms  = time_left_ms / moves_left + 0.8 * increment_ms
+budget_ms  = min(budget_ms, time_left_ms - 300)      # watchdog margin
+return       max(budget_ms, 10.0) / 1000.0           # 10 ms floor
+```
 
-`moves_left = max(20, 50 - fullmove_number)`; `share = time_left_ms / moves_left`; capped at
-`time_left_ms - 300`; floored at 10 ms. **Still ignores the 0.5 s/move increment.**
+Every move we make refills the clock by the increment, so `0.8 ×` it is time to spend, not
+hoard. `agent.py` **infers** `increment_ms` from the clock delta (see §3) rather than
+hardcoding it — an earlier cut hardcoded 500 ms, assumed a refill the 50 ms arena never gave,
+and drained the clock in ~7 moves (PROGRESS 2026-09-06 "Time management"). Verified: budget is
+always in `[10 ms, clock]` across clocks 1 ms … 120 s × increments 0/50/500.
 
-### `_search_root(board, depth, deadline, first) -> tuple[Move, int]` (lines 88-107)
+### `_search_root(board, depth, deadline, first) -> (Move, int)` (lines 120-139)
 
-`_ordered(...)` the legal moves, then move `first` to the front if present. Full-window
-(`-MATE-1`) alpha on every root move, narrowing beta via `alpha = max(alpha, score)`. Keeps the
-max with strict `>` (ties keep the earlier / better-ordered move → deterministic). Returns
-`(best_move, best_score)`. Does **not** probe or store the TT for the root itself (fine — the
-root is re-searched each iteration and `first` supplies the ordering).
+`_ordered(...)` the legal moves, move `first` to the front. Full-window alpha (`-MATE-1`) on
+each root move, narrowing beta via `alpha = max(alpha, score)`. Keeps the max with strict `>`
+(ties keep the earlier / better-ordered move → deterministic). The returned `best_score` is
+**exact for the chosen move**: move 1 is searched with an open lower bound (→ exact), and any
+later move only replaces the best when its child did *not* fail high (→ also exact); rejected
+moves get a fail-soft upper bound that can't affect the max. No TT probe/store at the root
+itself (it is re-searched every iteration; `first` supplies the ordering).
 
-### `_negamax(board, depth, ply, alpha, beta, deadline) -> int` (lines 110-170)
-
-Order of operations:
+### `_negamax(board, depth, ply, alpha, beta, deadline) -> int` (lines 142-212)
 
 1. `_tick(deadline)`.
 2. `is_fifty_moves()` → 0.
-3. `popcount(occupied) ≤ 4 and is_insufficient_material()` → 0.
-4. `moves = list(board.legal_moves)`; if empty → `-MATE + ply` (check) or 0 (stalemate).
-5. **`if depth <= 0: return evaluate(board)`** — leaf; the comment says "skip the transposition
-   key and table entirely". **This is now above the repetition check** — see finding 1.
-6. `key = board._transposition_key()` (interior nodes only).
-7. `if halfmove_clock >= 4 and (is_repetition(2) or key in _seen): return 0`.
-8. **TT probe:** `entry = _tt.get(key)`. Always extract `tt_move` for ordering. If
-   `e_depth >= depth`: return `e_value` when `_EXACT`, or `_LOWER and e_value >= beta`, or
-   `_UPPER and e_value <= alpha`.
-9. `_ordered(...)`, then move `tt_move` to the front if present.
-10. Search loop (fail-soft negamax + `alpha >= beta` cutoff), tracking `best_move`.
-11. **TT store**, only if `|value| < _MATE_THRESHOLD` (mate scores are root-relative → path-
-    dependent → not cacheable by position). Flag from the fail-soft result:
-    `value <= alpha_orig` → `_UPPER`; `value >= beta` → `_LOWER`; else `_EXACT`.
-    `if len(_tt) >= _TT_MAX: _tt.clear()` before insert.
+3. `popcount(occupied) ≤ 4 and is_insufficient_material()` → 0 (the popcount guard is a safe
+   necessary condition — every insufficient-material config has ≤ 4 pieces).
+4. `moves = list(board.legal_moves)`; empty → `-MATE + ply` (check) or 0 (stalemate).
+5. **Repetition / seen check, *before* the leaf return** (this is the fix for the 3b
+   regression): `key = board._transposition_key() if halfmove_clock >= 4 else None`; if
+   `key is not None and (is_repetition(2) or key in _seen)` → 0. Quiet leaves (`halfmove_clock
+   < 4`, common) still skip the key.
+6. `if depth <= 0: return _qsearch(board, ply, alpha, beta, deadline)`.
+7. Compute `key` if not already; **TT probe:** extract `tt_move` always; if `e_depth >= depth`
+   return `e_value` for `_EXACT`, or `_LOWER and e_value >= beta`, or `_UPPER and e_value <=
+   alpha`.
+8. `_ordered(board, moves, ply)`, then move `tt_move` to the front.
+9. Search loop (fail-soft, `alpha >= beta` cutoff). On a cutoff by a **quiet** move (not a
+   capture, no promotion), `_record_cutoff(move, ply, depth)`.
+10. **TT store**, only if `|value| < _MATE_THRESHOLD`: flag from the fail-soft result
+    (`value <= alpha_orig` → `_UPPER`; `value >= beta` → `_LOWER`; else `_EXACT`);
+    `if len(_tt) >= _TT_MAX: _tt.clear()` first.
 
-**Negamax / negation:** after `board.push(move)` it is the opponent's turn and `_negamax`
-returns a score relative to *that* side; `-` converts it back to this node's perspective.
+**Negamax / negation, alpha / beta, why alpha-beta is fast:** covered in earlier audits and
+unchanged — every node maximises its own score and negates the child's; `alpha` is the best the
+mover has already secured, `beta` the best the opponent can hold them to (`= -alpha` of the
+parent); `value >= beta` → opponent avoids the line → stop; with good ordering the tree shrinks
+from `b^d` to ≈ `b^(d/2)`. The TT + `first`/`tt_move` + killers/history all exist to make the
+ordering better.
 
-**alpha / beta:** `alpha` = the best the side to move has already secured elsewhere (a lower
-bound worth beating); `beta` = the best the opponent can hold them to (an upper bound),
-`= -alpha` of the parent. `value >= beta` → the opponent avoids this whole line → stop (beta
-cutoff / fail-high).
+**Mate distance (verified):** checkmate is `-MATE + ply`, `ply` from the root. Negated up the
+tree an immediate mate is `MATE - 1`, a mate two of our moves off `MATE - 3`, etc. — larger =
+faster, so the engine takes the fastest mate and the longest defence. Mate scores are **never
+cached** (root-relative → path-dependent).
 
-**Why alpha-beta is faster:** minimax visits `b^d` nodes (b ≈ 35); with good ordering
-alpha-beta visits ≈ `b^(d/2)` — the square root — because one refutation discards a line and
-ordering finds it first. Roughly doubles reachable depth. The TT and the `first` / `tt_move`
-hints exist to make the ordering better still.
+**TT soundness (verified this pass):** identical best move *and* score with the TT live vs
+neutered, at depth 5 across four middlegame/endgame positions, with quiescence and killers
+active; node counts 25-30 % lower with the TT.
 
-**Mate distance (verified):** checkmate is `-MATE + ply`, `ply` counted from the root. Negated
-up the tree, an immediate mate is `MATE - 1`, a mate two of our moves off is `MATE - 3`, etc.
-Larger = faster, so the engine **prefers the fastest mate and the longest defence**. `search_move`
-stops deepening once `|score| ≥ _MATE_THRESHOLD`.
+### `_qsearch(board, ply, alpha, beta, deadline) -> int` (lines 215-249)
 
-**Draw detection:** 50-move, insufficient material, in-search 2-fold repetition
-(`is_repetition(2)`), and reaching a position in the real game's history (`key in _seen`) all
-score 0. `_seen` is a set of keys with counts discarded (`agent.py` counts them, `search_move`
-drops the counts) — the deliberate **"first repetition = draw"** heuristic: safe (never misses a
-draw), at the cost of occasionally under-rating a won line that transposes through an earlier
-position.
+At `depth <= 0`, instead of calling `evaluate()` mid-exchange, keep searching:
 
-### `_ordered(board, moves) -> list[Move]` (lines 173-186) — unchanged since Phase 2
+- `ply >= _QS_MAX_PLY` → `evaluate(board)` (safety net).
+- **In check:** search *all* legal evasions; no moves → `-MATE + ply` (mate found in
+  quiescence, distance-correct); no stand-pat.
+- **Not in check:** `best = evaluate(board)` (stand pat); `best >= beta` → return; else
+  `alpha = max(alpha, best)` and search only captures + promotions.
+- Recurse with `-_qsearch(..., ply+1, -beta, -alpha)`, fail-soft, `alpha >= beta` cutoff.
 
-MVV-LVA on **piece-type ordinals** (1..6): `8 * victim - attacker`. `8 > 6` (king) guarantees a
-bigger victim always sorts first, including king captures (Phase 1's centipawn version scored
-`Kxp` at −19000). Queen promotions `+100`, other promotions `+10`. En passant:
-`piece_type_at(to_square)` is `None`, `or chess.PAWN` → victim = pawn (correct). `sorted` is
-stable → deterministic.
+`_ordered` is called without `ply` here → pure MVV-LVA capture ordering (no killers). Stand-pat
+assumes the mover can hold at least the static eval — fails only in zugzwang, a standard
+trade-off, correctly documented. Verified: resolves a hanging rook to ≥ +450 (> the static
+eval); leaves a quiet position exactly at the static eval; a capture-dense position terminates
+via `_Timeout` (no `RecursionError` — max ~160 stack frames vs the 1000 limit).
 
-### `_tick(deadline)` (lines 189-193)
+### `_ordered(board, moves, ply=-1) -> list[Move]` (lines 252-280)
 
-`_nodes += 1`; every 255 nodes check `time.monotonic() >= deadline` and raise `_Timeout`.
-`deadline` is `_budget_s` (capped at `clock − 300 ms`), and the 0.5 s increment tops the clock
-back up, so a one-slice overrun does not flag. Returning the last completed depth is safe: each
-depth is an independent search; a partial depth is discarded when `_Timeout` unwinds
-`_search_root`; tree cost is dominated by the deepest ply so the aborted depth wasted little.
+`sorted(moves, key=score, reverse=True)` (stable → deterministic). `score`:
+- capture → `_CAPTURE_BASE + 8*victim - attacker + promo` (victim/attacker are piece-type
+  ordinals 1..6; `8 > 6` guarantees a bigger victim always sorts first, king attacker included;
+  `promo` = 100 for =Q, 10 otherwise).
+- non-capture promotion → `_CAPTURE_BASE + (100 | 10)`.
+- `== killer0` → `_KILLER_0`; `== killer1` → `_KILLER_1` (this ply's slots, or `None` if
+  `ply < 0` / out of range).
+- else → `_hist[from*64 + to]`.
 
----
+Killers are looked up only against moves actually in the list, so an illegal killer from a
+sibling branch simply never matches — safe.
 
-## 3. How the files interact
+### `_record_cutoff(move, ply, depth)` (lines 283-290)
 
-```
-get_move(fen, time_left_ms)                              agent.py
-  board = chess.Board(fen)
-  _history[board._transposition_key()] += 1              count this position for the game
-  search_move(board, time_left_ms, _history)             search.py
-    _seen = frozenset(_history);  _tt.clear()
-    legal = board.legal_moves
-      none -> "0000"   |   one -> return it
-    deadline = now + _budget_s(...)
-    best = legal[0]
-    for depth in 1, 2, 3, ...:
-      _search_root(board, depth, deadline, first=best)
-        moves = _ordered(legal); move `first` to the front
-        for each move: push; score = -_negamax(board, depth-1, ply=1, -MATE-1, -alpha, dl); pop
-                       keep max; alpha = max(alpha, score)
-           _negamax:
-             _tick(); 50-move / insufficient -> 0
-             moves = board.legal_moves; none -> -MATE+ply / 0
-             depth<=0 -> return evaluate(board)                 <-- leaf (finding 1: no rep check)
-             key = board._transposition_key()
-             halfmove_clock>=4 and (is_repetition(2) or key in _seen) -> 0
-             TT probe: e_depth>=depth and bound usable -> return e_value
-             _ordered(moves); move tt_move to the front
-             loop: push; -_negamax(... ply+1 ...); pop; alpha/beta cutoff; track best_move
-             |value| < MATE-1000 -> _tt[key] = (depth, value, flag, best_move)
-      best = move;  |score| >= MATE-1000 or past deadline -> break
-    return best.uci()
-  except Exception: return legal[0].uci() if legal else "0000"      fallback that can't raise
-```
+Shift the ply's killer slots down and store `move` in slot 0 (guarded against duplicating it);
+`_hist[from*64 + to] += depth * depth` (deep cutoffs weigh more). Bounds verified: `ply` in a
+real `_negamax` node is ≤ 63 when `_ordered`/`_record_cutoff` run, so `base = ply*2 ≤ 126 <
+129` — always in range; the `0 <= base < _KILLER_SLOTS - 1` guard is belt-and-braces.
 
-**Why side-to-move eval fits negamax:** covered in section 1 — the signs stay consistent from
-leaf to root because `evaluate()` committed to the side-to-move convention on line 40, and every
-`-_negamax(...)` plus every `board.push` flips together.
+### `_tick(deadline)` (lines 293-297)
+
+`_nodes += 1`; every 255 nodes, `time.monotonic() >= deadline` → raise `_Timeout`. `deadline`
+is `_budget_s` (capped at `clock − 300 ms`); the 0.5 s increment tops the clock back up, so a
+one-slice overrun does not flag. Returning the last completed depth is safe — each depth is an
+independent search; a partial depth is discarded when `_Timeout` unwinds.
 
 ---
 
-## 4. Audit of the Phase 3b code
-
-### Verified correct (by running it)
-
-- **TT soundness.** Identical best move *and* score with the TT live vs neutered, at depth 4-7
-  across the three bench positions; node count ~5-6% lower with the TT. Alpha-beta + this TT is
-  still exact for the returned value.
-- **Fail-soft bound flags.** `alpha_orig` captured before the loop; `_UPPER` / `_LOWER` /
-  `_EXACT` assigned correctly; probe only returns on `e_depth >= depth` with a window-compatible
-  bound. `tt_move` is used for ordering even when the entry is too shallow to return — correct
-  and desirable.
-- **Mate scores are not cached** (`|value| < _MATE_THRESHOLD` guard) — right call, since
-  `MATE - ply` is root-relative. Verified: `Rb8#` still scores `MATE - 1`; mate found and ID
-  stops.
-- **`first` (previous-iteration best) tried first at the root** — the "iterative deepening feeds
-  move ordering" win the Phase 1 audit flagged as missing. This is where the arena gain comes
-  from (see below), not raw depth.
-- **`_transposition_key()` computed for interior nodes only** — leaves skip it (the intended
-  speed trade), which is exactly what causes finding 1.
-- **Determinism** preserved — `_tt` cleared per move and populated in a fixed node order;
-  `search_move` returns the same move on repeat runs.
-- **`best_move` is never stored as `None`** — the move loop always runs at least once and the
-  first iteration always sets `value`/`best_move` (the `-MATE-1` sentinel can't survive).
-- **Edge cases** from Phase 2 still hold: `"0000"` on no legal moves, single-move short-circuit,
-  non-raising `get_move` fallback, `AGENT_DEBUG` gating the only print.
-- `ruff` + `mypy --strict` clean; 11 tests pass; bench: endgame depth 6 → **7**, middlegame
-  still depth 4, overall nps ≈ −5% (TT overhead > nodes saved at these depths — expected).
-
-### Findings
-
-**1. [Important — fix before 3c] Repetition / `_seen` draw detection regressed at leaf nodes.**
-
-Phase 2 checked `is_repetition(2) or key in _seen` at the *top* of `_negamax`, before the
-`depth <= 0` leaf return. Phase 3b moved that check *below* the leaf return (to piggyback on the
-`key` it now computes only for interior nodes). So a position that is an in-search 2-fold
-repetition, or one the real game has already visited, **now returns `evaluate(board)` instead of
-0 when it lands exactly on the search horizon.**
-
-Verified directly: a KR-vs-K position back at a `_seen` key returns **+500 at depth 0**, **0 at
-depth 1**. Same for an in-search repetition.
-
-This partially re-opens the "leak a won game into a threefold" hole that Phase 2 closed. It is
-bounded to the horizon and to repetition-type draws (50-move and insufficient-material are still
-checked before the leaf return). Iterative deepening self-corrects at the next depth — *when
-there is time for it*.
-
-**It is not just theoretical.** At 3 s + 0.05 s the search often finishes only depth 3-4, and
-the arena shows the effect: phase-3-tt vs `versions/phase2` scored **47.5% with 9 threefold
-draws / 20**, versus `phase2`-vs-`phase2` at the same control (**57.5%, 3 threefold / 20**) and
-versus phase-3-tt's own **77.5%, 0 threefold** at the normal 10 s control. The competition is
-120 s + 0.5 s, so a long game routinely reaches low clock — this will cost games there, against
-PLAN priority #3 ("don't lose games to ourselves").
-
-*Minimal fix:* in the `depth <= 0` branch, still run the repetition/`_seen` test before
-returning `evaluate` — pay `_transposition_key()` there only when `halfmove_clock >= 4` (rare in
-sharp middlegames, so the leaf fast-path is mostly preserved):
+## 3. `agent.py` — entrypoint, history, increment inference
 
 ```python
-if depth <= 0:
-    if board.halfmove_clock >= 4 and (board.is_repetition(2)
-            or board._transposition_key() in _seen):
-        return 0
-    return evaluate(board)
+board = chess.Board(fen)
+key = board._transposition_key()
+_history[key] = _history.get(key, 0) + 1          # count every position we move in
+increment_ms = _infer_increment(time_left_ms)
+started = time.monotonic()
+try:    return search_move(board, time_left_ms, _history, increment_ms)
+except Exception:                                  # a search bug must never forfeit
+    legal = list(board.legal_moves); return legal[0].uci() if legal else "0000"
+finally:
+    _clock["prev"]  = float(time_left_ms)
+    _clock["spent"] = (time.monotonic() - started) * 1000.0
 ```
 
-**2. [Minor — handle in Phase 4] TT can cache a path-dependent draw score.**
-
-An interior node whose subtree returned 0 via the in-search `is_repetition(2)` folds that 0 into
-its stored `value`. If the same `key` is later probed on a path where that repetition would not
-occur, the cached value is wrong. `key in _seen` is path-independent (fixed game history), so
-only in-search repetitions contribute, and the contamination is bounded to one move because
-`_tt` is cleared each move. **This must be addressed when the Phase 4 persistent TT lands** —
-e.g. don't store a node whose subtree hit a repetition, or tag such entries.
-
-**3. [Minor] The TT is currently a small net speed loss** (~5% nodes/sec) — at depth 4-7 the
-key/probe/store overhead exceeds the nodes saved. The payoff is entirely move-ordering
-stability from seeding `first`/`tt_move` (draws 73/100 → ~1/20 at normal TC, +15 vs Phase 2).
-Fine — it's Phase 4 groundwork — but don't expect the bench to move until 3c/3d.
-
-**4. [Minor] `_TT_MAX` clears the whole table on overflow** rather than evicting, losing all
-ordering info mid-search. Cannot trigger in the pure-Python regime (~50 k nodes/search ≪ 1 M
-entries), so moot now; revisit with the fixed-size table in Phase 4.
-
-**5. [Nit, carried] `board._transposition_key()` is a private API**, used in `agent.py` and
-`search.py`. Fine while python-chess is pinned at 1.11 (platform + local); worth a comment.
-
-**6. [Nit] Redundant move generation** — `search_move` builds `board.legal_moves`, then
-`_search_root` builds it again. Trivial; Phase 3e movegen work subsumes it.
-
-### No bugs found in
-
-TT flag/probe logic, mate handling with the TT, the fail-soft window, determinism, the
-`get_move` fallback, `_last_depth` on timeout (correctly holds the last *completed* depth — the
-`break` precedes the assignment).
-
-### Docstring match
-
-The new `search.py` docstring accurately describes 3b: "a search result is cached by position…
-the best move from the last iteration is tried first… cleared each move for now; Phase 4 makes
-it persistent and fixed-size." True and verified.
-
-Against PLAN §Phase 3: 3a (profile) and 3b (TT) done; "arena vs Phase 2 shows the extra ply
-paying off" is **partially** met — the extra ply shows only in the endgame (6→7); the
-middlegame is still depth 4 and the arena gain is ordering, not depth. That is expected before
-3c/3d/3e and PROGRESS says as much.
-
-Still open from earlier audits (unchanged, not 3b's job): `_budget_s` ignores the 0.5 s
-increment; no explicit seed / documented tie-break (deterministic in practice); PLAN's "300+
-games vs random and vs greedy, zero crash/flag/illegal" not run since Phase 2.
+- **`_history`** feeds `_seen` in the search. Counts are kept but the search only uses the key
+  set — the deliberate "first repetition = draw" heuristic (safe: never misses a draw; can
+  under-rate a won line that transposes through an earlier position).
+- **`_infer_increment`**: `increment = time_left_ms - (prev - spent)`, clamped `[0, 2000]`.
+  Derives the per-move increment (`get_move` is not told it) from the clock delta since our last
+  move. `spent` is measured from *after* `_infer_increment` to the `finally`, so it runs a hair
+  short of the referee's measurement → the estimate is biased **low** → a smaller budget → the
+  safe direction. The process is suspended between our moves, so `spent` measures only our
+  compute — **no clock leakage.** Verified: a simulated true 50 ms increment is inferred as
+  49 ms.
+- The fallback can no longer raise (`legal[0]` / `"0000"`, never `next(iter(...))`).
+- `chess.Board(fen)` and `_transposition_key()` are outside the `try` — a malformed FEN would
+  propagate, but that is a platform-contract violation and cannot occur in a real game.
 
 ---
 
-## 5. Verdict
+## 4. Findings
 
-**Phase 1: Complete. Phase 2: Complete** (with the leaf-repetition caveat below).
-**Phase 3a: Complete. Phase 3b: Mostly complete** — the TT is sound and the move-ordering win is
-real and measured, but one Phase 2 guarantee regressed.
+### Verified correct
 
-### Fix before 3c
+- **TT is sound** with quiescence and killers in the mix (identical best move + score, TT on
+  vs off).
+- **Leaf-level repetition / `_seen`** now returns 0 at depth 0 *and* depth 1 — the 3b
+  regression this audit series flagged is fixed and has a regression test
+  (`test_seen_position_is_a_draw_at_the_horizon`).
+- **Mate distance** — `MATE - 1` for an immediate mate, distance-correct when being mated; mate
+  scores excluded from the TT.
+- **Bitboard `evaluate()`** matches the reference formula on every case tried, promoted pieces
+  and empty boards included.
+- **Determinism** — no RNG; stable sort over python-chess's fixed move order; first-seen
+  tie-break; killers/history populate deterministically and reset per move. Two full
+  `search_move` calls on one FEN return the same move.
+- **Time safety** — `_budget_s` always in `[10 ms, clock]`; `time_left_ms` of 5 / 1 / 0 / **−50**
+  all return a legal move in ~15 ms with no exception.
+- **`_qsearch`** finds mates (distance-correct), resolves hanging material, leaves quiet
+  positions at the static eval, and cannot `RecursionError`.
+- **Bounds** — `_killers` / `_hist` indexing is always in range for real search plies.
+- **Packaging** — the zip contains only the three root modules; `tools/` and `tests/` are not
+  shipped.
+
+### Finding 1 — `_qsearch` does not detect stalemate (or 50-move / repetition / insufficient) *(Minor→Moderate)*
+
+The not-in-check branch does `best = evaluate(board)` and then searches only captures/promotions.
+If the side to move has **no legal moves at all**, that is stalemate (a draw, 0) — but qsearch
+returns the material eval instead. Same for a capture line that trips the 50-move rule or
+repeats inside quiescence.
+
+`_negamax` catches stalemate for any move at `depth >= 1` (step 4), and iterative deepening
+corrects the score at the next depth — so this only bites when the search finishes shallow, i.e.
+**at low clock**, and only for a stalemate reached *by a capture or promotion* (quiet stalemates
+never arise in qsearch). It is uncommon, but it lines up with the observed weakness: the rated
+game took ~80 moves to convert a won position and a smoke game drew by `ply_cap`. Given PLAN
+priority #3 ("don't lose games to ourselves"), a cheap guard is worth it:
+
+```python
+else:  # not in check
+    if not any(board.generate_legal_moves()):   # stalemate
+        return 0
+    best = evaluate(board)
+    ...
+```
+
+(one extra movegen per quiet qsearch node; measure the nps cost, or gate it on a low piece
+count).
+
+### Finding 2 — `_qsearch` has no width limit *(Minor)*
+
+No delta pruning, no SEE. A capture-dense position (e.g. many major pieces mutually en prise)
+can spend the **entire move budget** inside one `_qsearch` call — verified: a queen-pile
+position ran until the deadline. It is *safe* (`_Timeout` propagates to `search_move`, which
+returns the last completed depth), but the engine can then complete only depth 1-2 in that
+position. Delta pruning is already on the Phase 4 list — keep it there.
+
+### Finding 3 — the board is left dirty after a `_Timeout` *(Minor, latent)*
+
+`board.push(move)` on line 187/132, then the recursive call raises `_Timeout`, so
+`board.pop()` is skipped — at every frame up the stack. Verified: after a forced timeout the
+caller's board has 7-8 unpopped moves and a changed FEN.
+
+**Currently harmless** — `agent.get_move` builds a fresh `chess.Board(fen)` every call and never
+touches it again once `search_move` returns. But it is a trap for any future change that reuses
+the board (a persistent board object, calling `search_move` twice, a test that inspects the
+board afterward). A `try: ... finally: board.pop()` around each push/recurse, or catching
+`_Timeout` one level higher and resetting, removes the trap.
+
+### Finding 4 — TT can cache a path-dependent draw score *(Minor, carried; Phase 4 blocker)*
+
+An interior node whose subtree returned 0 via the in-search `is_repetition(2)` folds that 0
+into its stored `value`; probed later on a path where the repetition would not occur, the cached
+value is wrong. `key in _seen` is path-independent (fixed game history), so only in-search
+repetitions contribute, and the damage is bounded to one move because `_tt` is cleared each
+move. The code comment already flags this. **It must be handled before the Phase 4 persistent
+TT lands** (don't store a node whose subtree hit a repetition, or tag such entries).
+
+### Finding 5 — `_budget_s` is too aggressive in long games *(Minor, carried)*
+
+`moves_left = max(20, 50 - fullmove_number)` pins at 20 from move 30 on, so every later move
+budgets `clock/20 + 0.8·inc` regardless of how many moves actually remain. The first rated game
+finished with 4.5 s on the clock (opponent had 21 s) in a 91-move game. Not a flag risk (the
+`0.8·inc` term sustains ~400 ms/move), but it leaves the engine thin on time exactly when long
+technical endgames need it. PROGRESS already notes this as "a minor later tweak."
+
+### Finding 6 — move-ordering bands can theoretically collide *(Minor)*
+
+`_hist` has no cap and only grows within a move. The bands are `_CAPTURE_BASE = 10 M`, killers
+9 M / 8 M, history from 0. In the current ~50-200 k node/search regime a hot `_hist` slot
+reaches ~10-50 k — nowhere near 8 M — so ordering is well-separated. Once 3e multiplies nps,
+re-check that a hot slot can't pass `_KILLER_1`; clamp the per-slot history contribution if
+needed.
+
+### Finding 7 — Phase 4b does not visibly beat Phase 4a in the arena *(Important to resolve, not a code bug)*
+
+PROGRESS says "each frozen step beats the last decisively." This audit's run of **phase4b vs
+`versions/phase4a`, 20 games @ 10 s + 0.1 s, scored 40 % (+2 =12 −6)** — 10 of the draws by the
+fifty-move rule. Meanwhile phase4b is 100 % vs `minimax` and 87.5 % vs Phase 2, so the engine is
+strong and not broken; this is specifically the near-mirror match against the previous version.
+
+Two readings, and they need separating:
+
+- **Benign:** 12 of 20 games are draws, so the result rests on 8 decisive games — pure variance
+  on top of the thin-eval "two engines with no plan shuffle to a fifty-move draw" problem
+  PROGRESS already owns. 40 % is ~1.3 σ from 50 %.
+- **Not benign:** killer/history ordering does not change the move at a fixed depth (both sides
+  are exact alpha-beta), only which depth the budget buys. A mis-tuned history heuristic can
+  *cost* depth in some positions and make 4b a net-neutral-or-negative change despite the
+  bench looking fine.
+
+Either way, **4b's gain is unproven.** Before stacking more ordering heuristics (null-move, LMR,
+PVS) on top, run a few-hundred-game arena vs 4a at a recorded time control and confirm the
+direction — the same lesson the 3b audit already flagged about recording the TC and running
+enough games. If 4b turns out neutral, that is worth knowing now.
+
+### Nits
+
+- `board._transposition_key()` is a private python-chess API, used in `agent.py` and
+  `search.py`. Fine while python-chess is pinned at 1.11 (platform + local); a one-line comment
+  would pin the assumption.
+- `evaluate()` depends on `int.bit_count()` (Python 3.10+). Platform is 3.12, so fine — but it
+  is an implicit version floor worth a note.
+- No explicit RNG seed. Deterministic by construction and documented in the `search.py`
+  docstring; PLAN wants a seed stated for finals reproducibility. The nuance: determinism holds
+  *at a fixed depth*, and wall-clock timing decides the depth reached, so the same position can
+  yield different moves on a slower machine.
+
+### Docstring / PROGRESS accuracy
+
+`search.py`'s docstring accurately describes 3b + 4a + 4b and the determinism guarantee.
+PROGRESS is accurate and unusually candid — it records the hardcoded-increment mistake, the 3b
+leaf-repetition regression and its fix, and the 80-move conversion as the Phase 5 signal. Good
+discipline; keep it.
+
+Still open from earlier audits (not this phase's job): **Phase 2's formal clean bar — "300+
+games vs `random` and vs `greedy`, zero crash / flag / illegal" — has never been run as a
+gate**, even though the engine is now submitted and playing rated games.
+
+---
+
+## 5. Speed reality check
+
+| position | Phase 3a baseline | now (4b) |
+|---|---|---|
+| open middlegame | depth 4, 23 k nps | depth 4, ~32 k nps |
+| sharp middlegame | depth 4, 23 k nps | depth 4, ~40 k nps |
+| rook endgame | depth 6, 36 k nps | depth 7, ~49 k nps |
+| overall | 27 k nps | ~40 k nps |
+
+3c (bitboard eval) + the search work bought ~1.5× nps, and the endgame gained a ply, but **the
+middlegame is still stuck at depth 4** — the Phase 3 target was 6-7. `board.legal_moves` (full
+legality in Python) is the per-node cost and only 3e (the jitted move generator) removes it.
+PROGRESS's reorder — pruning + real eval before 3e — is defensible ("get it right, then get it
+fast", and the engine already beats every baseline), but depth 4 in sharp middlegames is the
+ceiling on tactical strength until 3e happens, and it is visible in the rated game's 7 blunders.
+
+---
+
+## 6. Verdict
+
+**Phase 1-3c, time management, Phase 4a-4b: Complete.** No critical issues, no correctness bugs
+in the main search. The engine is sound, deterministic, submitted, and winning rated games.
+
+### Fix list
 
 **Critical**
 
@@ -370,20 +432,31 @@ real and measured, but one Phase 2 guarantee regressed.
 
 **Important**
 
-1. **Restore leaf-level repetition / `_seen` detection** (finding 1). Two lines. Without it the
-   engine leaks won/equal games into threefold draws whenever it is low on clock — measured, not
-   hypothetical.
-2. **Record the arena time control in PROGRESS.** "83.8% vs Phase 2" holds at 10 s + 0.1 s and
-   collapses at 3 s + 0.05 s; a strength claim without its TC is not reproducible. Re-run the
-   comparison after fixing finding 1.
+1. **Confirm Phase 4b is actually a gain** (finding 7). A few hundred games vs `versions/phase4a`
+   at a recorded time control before adding null-move / LMR / PVS. This run scored 40 %; that
+   is probably mirror-match + thin-eval variance, but "probably" is not the bar, and a
+   mis-tuned history heuristic costing depth is a real alternative.
+2. **`_qsearch` stalemate guard** (finding 1). Small change, and it targets the exact weakness
+   already costing games — slow won-position conversion and a `ply_cap` draw. Measure the nps
+   cost of the extra movegen; gate it on low piece count if needed.
+3. **Run Phase 2's clean bar now** — 300+ games vs `random` and vs `greedy`, assert zero
+   crash / flag / illegal, and wire it into `make gate` or a documented pre-upload step. The
+   engine is live in rated rounds without this having ever been run formally.
 
 **Optional**
 
-3. Note finding 2 (TT + path-dependent draw scores) in the Phase 4 plan so the persistent table
-   handles it from the start.
-4. Reconsider `_TT_MAX` behaviour (evict vs clear) when the fixed-size Phase 4 table lands.
-5. Carry-overs: increment-aware `_budget_s`; explicit seed + documented tie-break; run the
-   Phase 2 "done" bar (300+ games vs random and greedy).
+3. `try/finally` (or a helper) around push/pop so a `_Timeout` leaves the board clean
+   (finding 3) — cheap insurance against a future refactor.
+4. Handle the TT path-dependent-draw case **before** the persistent TT (finding 4).
+5. `_budget_s`: use real moves-remaining, not `max(20, …)`, so long endgames aren't starved
+   (finding 5).
+6. Clamp the per-slot history contribution before 3e multiplies node counts (finding 6).
+7. qsearch delta pruning (finding 2) — already on the Phase 4 list.
+8. State an explicit seed / tie-break for finals reproducibility; note the `int.bit_count()`
+   Python floor and the private `_transposition_key()` dependency.
+9. The KX-vs-K mate driver PROGRESS already plans for Phase 5 — it directly addresses the
+   80-move conversion.
 
-No Phase 3c+ work and no redesign — negamax + alpha-beta + iterative deepening + TT is the right
-spine. Finding 1 is the one thing standing between "Phase 2 is genuinely intact" and not.
+No redesign — negamax + alpha-beta + iterative deepening + TT + quiescence + killers/history is
+the right spine, cleanly implemented. The open work is quiescence robustness, the deferred
+speed (3e), and real evaluation (Phase 5).
