@@ -92,6 +92,23 @@ def test_qsearch_leaves_a_quiet_position_at_the_static_eval() -> None:
     assert q == evaluate.evaluate(board)
 
 
+def test_cutoff_updates_killers_and_history() -> None:
+    move = chess.Move.from_uci("e2e4")
+    base = 3 * 2
+    search._killers[base] = None
+    search._killers[base + 1] = None
+    idx = move.from_square * 64 + move.to_square
+    before = search._hist[idx]
+    try:
+        search._record_cutoff(move, ply=3, depth=5)
+        assert search._killers[base] == move
+        assert search._hist[idx] == before + 25
+    finally:
+        search._killers[base] = None
+        search._killers[base + 1] = None
+        search._hist[idx] = before
+
+
 def test_budget_stays_sane_across_clocks() -> None:
     board = chess.Board()
     for clock in (150, 1_000, 8_000, 60_000, 120_000):

@@ -5,26 +5,28 @@ definitions live in [docs/PLAN.md](docs/PLAN.md).
 
 ## Current status (2026-09-06)
 
-- **Engine:** Phase 3b merged to `main`. Negamax + alpha-beta + iterative deepening,
-  MVV-LVA ordering, transposition table (cleared per move), previous-iteration move first,
-  material + pawn-PST eval, mate-distance scoring, history-driven draw awareness,
-  increment-aware time budget.
-- **Strength:** Phase 3b scored 83.8% vs frozen Phase 2 at 10 s + 0.1 s (+33 =1 -6);
-  60-65% at 3 s + 0.05 s after the leaf-repetition fix. Phase 2 itself: 100% vs
-  `baselines/greedy`, 55.5% vs frozen Phase 1. Zero self-inflicted losses throughout.
-- **Tests:** 13 passing, run by `make gate` (ruff + mypy strict + pytest + 2 games).
+- **Engine:** Phase 4a merged to `main`. Negamax + alpha-beta + iterative deepening,
+  transposition table (per move) + previous-iteration move first, MVV-LVA ordering,
+  quiescence search at the horizon, bitboard material + pawn-PST eval, mate-distance
+  scoring, history-driven draw awareness, increment-aware time budget.
+- **Strength:** each frozen step beats the last decisively — 3b 83.8% vs 2, 3c 67.5% vs
+  3b, 4a 100% vs 3c. Beats every baseline (97.5% vs minimax, 87.5% vs numba). Won its
+  first rated game. Zero self-inflicted losses throughout.
+- **Tests:** run by `make gate` (ruff + mypy strict + pytest + 2 games).
 - **Submitted:** first upload passed validation (ready in 0.5 s, won its smoke game). Live
   in the hourly rated rounds.
 - **Reordered:** the engine already beats every baseline (97.5% vs minimax, 87.5% vs
   numba), so Phase 4 (pruning stack) and Phase 5 (real eval) come before the big, risky
   3e jitted move generator. "Get it right, then get it fast."
-- **In flight:** branch `phase-4-quiescence` — quiescence search (Phase 4a).
-- **Next Phase 4:** killers + history, null-move pruning, LMR, PVS, persistent TT.
+- **In flight:** branch `phase-4-ordering` — killer moves + history heuristic (Phase 4b).
+- **Next Phase 4:** null-move pruning, LMR, PVS, persistent TT. Then Phase 5 (real eval),
+  starting with a KX-vs-K mate driver — the first rated game took ~80 moves to convert a
+  won position.
 
 ## Branches / versions
 
-- `main` — Phase 3b engine.
-- `versions/phase1/`, `versions/phase2/`, `versions/phase3b/` — frozen arena opponents.
+- `main` — Phase 4a engine.
+- `versions/phase{1,2,3b,3c,4a}/` — frozen arena opponents.
 - Baselines: `random` < `greedy` (1-ply material) < `minimax` (2-ply) < `numba`.
 
 ## Log
@@ -170,3 +172,23 @@ definitions live in [docs/PLAN.md](docs/PLAN.md).
 - Fixes the horizon effect: the eval was being read one ply before a recapture.
 - Tests: `_qsearch` resolves a hanging rook (>= +450, and more than the static eval), and
   leaves a quiet position exactly at the static eval.
+
+### 2026-09-06 — First rated game
+
+- Won a rated game by checkmate against another team's agent. Stockfish-16 depth-16
+  review: 86.8% accuracy, 51 ACPL, 45 best / 17 excellent / 10 good, but **7 blunders**
+  and it took ~80 moves to convert a totally won position (king shuffling until pawn
+  promotions forced a mate). Finished with 4.5 s on the clock to the opponent's 21 s.
+- Read: the blunders are depth/tactics; the 80-move conversion is missing mating
+  technique = the Phase 5 signal. The tight clock is `moves_left` pinned at 20 being too
+  aggressive in a 91-move game - a minor later tweak.
+
+### 2026-09-06 — Phase 4b: killers + history (branch `phase-4-ordering`)
+
+- `_killers` (two flat slots per ply) and `_hist` (4096 from/to counts), both reset each
+  move. A quiet move that beta-cuts is stored as a killer for its ply and adds `depth*depth`
+  to its history score.
+- `_ordered` now takes `ply` and ranks: captures/promotions (MVV-LVA) > killer 0 > killer
+  1 > quiet moves by history. The TT move is still forced to the front by the caller.
+  `_qsearch` and `_search_root` pass no ply, so they keep pure capture ordering.
+- Test: `_record_cutoff` updates the killer slot and adds `depth*depth` to history.
