@@ -14,7 +14,8 @@ definitions live in [docs/PLAN.md](docs/PLAN.md).
 - **Tests:** 11 passing, run by `make gate` (ruff + mypy strict + pytest + 2 games).
   `tests-and-gate` merged (PR #3).
 - **In flight:** branch `phase-3-tt` — transposition table + iterative-deepening move
-  ordering (step 3b). **83.8% vs frozen Phase 2**, 1 draw in 40 games.
+  ordering (step 3b). **83.8% vs frozen Phase 2 at 10 s + 0.1 s**, 1 draw in 40 games.
+  A leaf-level repetition regression found in review is fixed (see log).
 - **Next:** 3c numba-jitted eval, 3d incremental eval, 3e jitted move generator.
 
 ## Branches / versions
@@ -108,5 +109,13 @@ definitions live in [docs/PLAN.md](docs/PLAN.md).
 - `_search_root` now takes the previous iteration's best move and searches it first — the
   "iterative deepening feeds move ordering" win the audit flagged as missing.
 - Bench barely moved (middlegame still depth 4, ~-5% nodes/sec; endgame depth 6 -> 7).
-  But the arena jumped: **83.8% vs frozen Phase 2 (+33 =1 -6)**, draws down from 73/100
-  to 1/40. The gain is move-ordering quality and plan stability, not raw depth.
+  But the arena jumped: **83.8% vs frozen Phase 2 (+33 =1 -6) at 10 s + 0.1 s**, draws
+  down from 73/100 to 1/40. The gain is move-ordering quality and plan stability, not raw
+  depth.
+- **Regression found in review and fixed:** moving the transposition-key computation
+  below the `depth <= 0` leaf return also skipped the `is_repetition(2) / key in _seen`
+  draw check at the horizon, so a repetition landing exactly on the last ply scored by
+  material instead of 0. Invisible at 10 s (search is deep enough to catch it a ply up),
+  but at 3 s + 0.05 s it leaked 9/20 games into threefolds vs a 3/20 control. Fix: run
+  the draw check before the leaf return, computing the key only when `halfmove_clock >= 4`
+  makes a repetition possible. Regression test added.
