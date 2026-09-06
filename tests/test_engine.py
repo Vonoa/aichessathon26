@@ -61,6 +61,18 @@ def test_is_deterministic() -> None:
     assert first == second
 
 
+def test_seen_position_is_a_draw_at_the_horizon() -> None:
+    # Regression (Phase 3b): a position already seen in the game must score 0 even at
+    # depth 0, not be evaluated by material.
+    board = chess.Board("8/8/8/4k3/8/8/3RK3/8 w - - 10 40")  # white is up a whole rook
+    search._seen = frozenset({board._transposition_key()})
+    try:
+        at_horizon = search._negamax(board, 0, 1, -search.MATE, search.MATE, time.monotonic() + 5)
+    finally:
+        search._seen = frozenset()
+    assert at_horizon == 0
+
+
 def test_move_one_stays_within_budget_and_searches() -> None:
     # A guard for Phase 3: if numba ever compiles on the clock, move 1 blows this.
     started = time.monotonic()
