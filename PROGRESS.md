@@ -5,23 +5,21 @@ definitions live in [docs/PLAN.md](docs/PLAN.md).
 
 ## Current status (2026-09-06)
 
-- **Engine:** Phase 2 complete and merged to `main`. Negamax + alpha-beta + iterative
-  deepening, MVV-LVA ordering, material + pawn-PST evaluation, mate-distance scoring,
-  draw/repetition awareness driven by game history, per-move time budget.
-- **Strength:** 100% vs `baselines/greedy` (40/40), 55.5% vs the frozen Phase 1
-  (+19 =73 -8 — the draw flood is two thin-eval engines with no plan, an evaluation
-  signal, not a bug). Zero `flag` / `crash` / `illegal` / `init` across 140 games.
-- **Tests:** 11 passing, run by `make gate` (ruff + mypy strict + pytest + 2 games).
-  `tests-and-gate` merged (PR #3).
-- **In flight:** branch `phase-3-tt` — transposition table + iterative-deepening move
-  ordering (step 3b). **83.8% vs frozen Phase 2 at 10 s + 0.1 s**, 1 draw in 40 games.
-  A leaf-level repetition regression found in review is fixed (see log).
+- **Engine:** Phase 3b merged to `main`. Negamax + alpha-beta + iterative deepening,
+  MVV-LVA ordering, transposition table (cleared per move), previous-iteration move first,
+  material + pawn-PST eval, mate-distance scoring, history-driven draw awareness,
+  increment-aware time budget.
+- **Strength:** Phase 3b scored 83.8% vs frozen Phase 2 at 10 s + 0.1 s (+33 =1 -6);
+  60-65% at 3 s + 0.05 s after the leaf-repetition fix. Phase 2 itself: 100% vs
+  `baselines/greedy`, 55.5% vs frozen Phase 1. Zero self-inflicted losses throughout.
+- **Tests:** 13 passing, run by `make gate` (ruff + mypy strict + pytest + 2 games).
+- **In flight:** branch `time-management` — increment-aware `_budget_s` + determinism note.
 - **Next:** 3c numba-jitted eval, 3d incremental eval, 3e jitted move generator.
 
 ## Branches / versions
 
-- `main` — Phase 2 engine.
-- `versions/phase1/`, `versions/phase2/` — frozen agents, used as arena opponents.
+- `main` — Phase 3b engine.
+- `versions/phase1/`, `versions/phase2/`, `versions/phase3b/` — frozen arena opponents.
 - Baselines: `random` < `greedy` (1-ply material) < `minimax` (2-ply) < `numba`.
 
 ## Log
@@ -119,3 +117,22 @@ definitions live in [docs/PLAN.md](docs/PLAN.md).
   but at 3 s + 0.05 s it leaked 9/20 games into threefolds vs a 3/20 control. Fix: run
   the draw check before the leaf return, computing the key only when `halfmove_clock >= 4`
   makes a repetition possible. Regression test added.
+
+### 2026-09-06 — Time management (branch `time-management`)
+
+- `_budget_s` adds `0.8 * increment` to each move's share of the clock: every move we make
+  refills the clock by the increment, so it is time to spend, not hoard. Capped at
+  `clock - 300 ms`, floored at 10 ms.
+- First cut hardcoded the increment at 500 ms (the competition value). It scored **32.5%
+  vs frozen Phase 3b at 3 s + 0.05 s** — the arena's real increment is 50 ms, so the
+  budget assumed a 500 ms refill it never got and drained the clock in ~7 moves. No flags,
+  just collapse. Lesson: never hardcode a clock parameter the harness can vary.
+- Fix: `agent.get_move` infers the increment from the clock delta since our last move
+  (`new_clock == old_clock - our_spend + increment`), measuring our own spend with
+  `time.monotonic()`, and passes it through. Defaults to 0 (the old safe formula) until
+  the second move. Our spend measures a hair short of the referee's, biasing the estimate
+  low - the safe direction.
+- Determinism stated in the module docstring (no RNG, stable sort over fixed move order,
+  first-seen tie-break). Tests added for `_budget_s` sanity and `_infer_increment`.
+- Carry-overs still open: Phase 2's 300-game clean bar, `_TT_MAX` clear-vs-evict, and the
+  persistent-TT path-dependence (deferred to Phase 4 / a longer run).

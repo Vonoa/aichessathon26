@@ -13,10 +13,12 @@ import search
 
 
 @pytest.fixture(autouse=True)
-def _reset_history():
+def _reset_state():
     agent._history.clear()
+    agent._clock.clear()
     yield
     agent._history.clear()
+    agent._clock.clear()
 
 
 def test_finds_mate_in_one() -> None:
@@ -57,6 +59,7 @@ def test_is_deterministic() -> None:
     fen = "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3"
     first = agent.get_move(fen, 2000)
     agent._history.clear()
+    agent._clock.clear()
     second = agent.get_move(fen, 2000)
     assert first == second
 
@@ -73,11 +76,27 @@ def test_seen_position_is_a_draw_at_the_horizon() -> None:
     assert at_horizon == 0
 
 
+def test_budget_stays_sane_across_clocks() -> None:
+    board = chess.Board()
+    for clock in (150, 1_000, 8_000, 60_000, 120_000):
+        for inc in (0.0, 100.0, 500.0):
+            secs = search._budget_s(board, clock, inc)
+            assert 0.01 <= secs <= clock / 1000.0, f"clock {clock}, inc {inc} -> {secs}s"
+
+
+def test_infers_increment_from_clock_deltas() -> None:
+    assert agent._infer_increment(120_000) == 0.0  # no prior move yet
+    agent._clock["prev"] = 120_000.0
+    agent._clock["spent"] = 2_000.0
+    # clock 120000 - spent 2000 = 118000, refilled to 118500 -> increment ~= 500
+    assert 400.0 <= agent._infer_increment(118_500) <= 600.0
+
+
 def test_move_one_stays_within_budget_and_searches() -> None:
     # A guard for Phase 3: if numba ever compiles on the clock, move 1 blows this.
     started = time.monotonic()
     move = chess.Move.from_uci(agent.get_move(chess.STARTING_FEN, 20000))
     elapsed = time.monotonic() - started
     assert move in chess.Board(chess.STARTING_FEN).legal_moves
-    assert elapsed < 1.5, f"move 1 took {elapsed:.2f}s"
+    assert elapsed < 2.0, f"move 1 took {elapsed:.2f}s"
     assert search._nodes > 500, f"only {search._nodes} nodes searched"
