@@ -345,6 +345,7 @@ _PIECE_TYPES = (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN,
 #   4  jitted mobility + king safety (via _ray_attacks -- the speed win)   [done]
 #   5  evaluate() calls the jitted path (_evaluate_jit); the old body is    [done]
 #      _evaluate_reference, the oracle for the golden + equivalence tests.
+#   6  set-bit iteration in _material_pst; _encode fills reused buffers     [done]
 # Each kernel is pinned against the Python eval above by tests/test_evaljit.py.
 # ---------------------------------------------------------------------------
 
@@ -393,23 +394,30 @@ def _ray_attacks(occ: np.uint64, sq: int, dirs: npt.NDArray[np.int64]) -> np.uin
 
 def _encode(
     board: chess.Board,
+    pieces: npt.NDArray[np.uint64] | None = None,
+    occ: npt.NDArray[np.uint64] | None = None,
 ) -> tuple[npt.NDArray[np.uint64], npt.NDArray[np.uint64], bool]:
-    """Board -> fixed arrays the jitted eval reads, built once per evaluate() call.
+    """Board -> fixed arrays the jitted eval reads.
 
     Returns:
       pieces: shape (2, 6) uint64 -- pieces[colour][piece_type - 1] bitboard,
               colour 0 = White, 1 = Black; piece_type is chess.PAWN..chess.KING.
       occ:    shape (3,) uint64 -- [white occupancy, black occupancy, all occupancy].
       turn:   True if White is to move (for the final side-to-move sign flip).
+
+    `pieces` and `occ`, if given, are filled in place -- the search passes two module
+    buffers so a leaf's eval allocates nothing. Omit them for a fresh pair (tests).
     """
-    pieces = np.empty((2, 6), dtype=np.uint64)
+    if pieces is None:
+        pieces = np.empty((2, 6), dtype=np.uint64)
+    if occ is None:
+        occ = np.empty(3, dtype=np.uint64)
     for pt in range(1, 7):
         pieces[0, pt - 1] = board.pieces_mask(pt, chess.WHITE)
         pieces[1, pt - 1] = board.pieces_mask(pt, chess.BLACK)
-    occ = np.array(
-        [board.occupied_co[chess.WHITE], board.occupied_co[chess.BLACK], board.occupied],
-        dtype=np.uint64,
-    )
+    occ[0] = board.occupied_co[chess.WHITE]
+    occ[1] = board.occupied_co[chess.BLACK]
+    occ[2] = board.occupied
     return pieces, occ, board.turn
 
 
@@ -465,22 +473,29 @@ def _material_pst(
 ) -> tuple[int, int]:
     """(mg, eg) material + piece-square sums, White-positive. Black squares are
     mirrored (sq ^ 56) and subtracted, exactly as evaluate()'s piece loop does.
+
+    Iterates set bits (a board has ~16-32 pieces) rather than scanning all 64 squares.
     """
     mg = 0
     eg = 0
     for pt in range(6):
         v = int(values[pt])
-        white_bb = pieces[0, pt]
-        black_bb = pieces[1, pt]
-        for sq in range(64):
-            bit = _BB_SQUARES[sq]
-            if (white_bb & bit) != np.uint64(0):
-                mg += v + int(pst_mg[pt, sq])
-                eg += v + int(pst_eg[pt, sq])
-            if (black_bb & bit) != np.uint64(0):
-                idx = sq ^ 56
-                mg -= v + int(pst_mg[pt, idx])
-                eg -= v + int(pst_eg[pt, idx])
+
+        bb = pieces[0, pt]
+        while bb != np.uint64(0):
+            lsb = bb & (~bb + np.uint64(1))
+            sq = int(_popcount(lsb - np.uint64(1)))
+            mg += v + int(pst_mg[pt, sq])
+            eg += v + int(pst_eg[pt, sq])
+            bb &= bb - np.uint64(1)
+
+        bb = pieces[1, pt]
+        while bb != np.uint64(0):
+            lsb = bb & (~bb + np.uint64(1))
+            idx = int(_popcount(lsb - np.uint64(1))) ^ 56
+            mg -= v + int(pst_mg[pt, idx])
+            eg -= v + int(pst_eg[pt, idx])
+            bb &= bb - np.uint64(1)
     return mg, eg
 
 
@@ -829,6 +844,12 @@ def _evaluate_reference(board: chess.Board) -> int:
     return tapered if board.turn == chess.WHITE else -tapered
 
 
+# Reused every evaluate() call so a leaf's eval allocates nothing. Safe because the
+# search is single-threaded and _evaluate_jit reads them before evaluate() returns.
+_EVAL_PIECES: npt.NDArray[np.uint64] = np.empty((2, 6), dtype=np.uint64)
+_EVAL_OCC: npt.NDArray[np.uint64] = np.empty(3, dtype=np.uint64)
+
+
 def evaluate(board: chess.Board) -> int:
     """Tapered eval, centipawns, from the side-to-move's point of view (negamax
     convention). Runs the numba-jitted path; _evaluate_reference() is the pure-python
@@ -845,5 +866,5 @@ def evaluate(board: chess.Board) -> int:
     if white_king is None or black_king is None:
         return _evaluate_reference(board)  # not a legal search position; stay safe
 
-    pieces, occ, white_to_move = _encode(board)
+    pieces, occ, white_to_move = _encode(board, _EVAL_PIECES, _EVAL_OCC)
     return int(_evaluate_jit(pieces, occ, white_king, black_king, white_to_move))

@@ -88,6 +88,19 @@ def test_encode_matches_board() -> None:
             assert int(pieces[1, pt - 1]) == board.pieces_mask(pt, chess.BLACK)
 
 
+def test_encode_fills_provided_buffers() -> None:
+    board = chess.Board("r1bq1rk1/pp2bppp/2n1pn2/2pp4/3P1B2/2PBPN2/PP1N1PPP/R2Q1RK1 w - - 0 9")
+    pbuf = np.zeros((2, 6), dtype=np.uint64)
+    obuf = np.zeros(3, dtype=np.uint64)
+    pieces, occ, turn = evaluate._encode(board, pbuf, obuf)
+    assert pieces is pbuf
+    assert occ is obuf
+    fresh_p, fresh_o, fresh_turn = evaluate._encode(board)
+    assert (pieces == fresh_p).all()
+    assert (occ == fresh_o).all()
+    assert turn == fresh_turn
+
+
 # --- step 2: material + tapered PST ---------------------------------------------
 
 
