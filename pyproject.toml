@@ -41,4 +41,4 @@ known-first-party = ["agent", "search", "evaluate"]
 
 [tool.mypy]
 strict = true
-files = ["agent.py", "search.py", "evaluate.py", "harness"]
+files = ["agent.py", "search.py", "evaluate.py"]  # harness/ is upstream's and now has OS-specific code
