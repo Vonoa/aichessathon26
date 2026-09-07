@@ -1,7 +1,7 @@
 [project]
 name = "aichessathon-starter"
 version = "0.1.0"
-requires-python = ">=3.12"
+requires-python = "==3.12.*"
 dependencies = [
     "chess==1.11.2",
     "numpy==2.5.2",
@@ -41,4 +41,4 @@ known-first-party = ["agent", "search", "evaluate"]
 
 [tool.mypy]
 strict = true
-files = ["agent.py", "search.py", "evaluate.py", "harness"]
+files = ["agent.py", "search.py", "evaluate.py"]  # harness/ is upstream's and now has OS-specific code
