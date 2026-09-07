@@ -17,6 +17,9 @@ accrues a score that ranks the remaining quiet moves. Both reset each move.
 Phase 5f adds contempt: every draw path scores _CONTEMPT below equal from the root side's
 point of view, so the engine only accepts a draw when it genuinely believes it is worse.
 
+Check extension: a node that is in check is searched one ply deeper, so a forcing line
+resolves before it is evaluated.
+
 The engine is deterministic by construction: no RNG is imported, move ordering is a
 stable sort over python-chess's fixed generation order, and ties are broken by first-seen.
 The same position and clock always produce the same move.
@@ -148,6 +151,10 @@ def _negamax(
     board: chess.Board, depth: int, ply: int, alpha: int, beta: int, deadline: float
 ) -> int:
     _tick(deadline)
+    in_check = board.is_check()
+    if in_check and ply < _MAX_DEPTH:
+        depth += 1  # check extension: let a forcing line resolve before we evaluate it
+
     if board.is_fifty_moves():
         return _draw_score(ply)
     if chess.popcount(board.occupied) <= 4 and board.is_insufficient_material():
@@ -155,7 +162,7 @@ def _negamax(
 
     moves = list(board.legal_moves)
     if not moves:
-        return -MATE + ply if board.is_check() else _draw_score(ply)
+        return -MATE + ply if in_check else _draw_score(ply)
 
     # A repetition or an already-seen position is a draw even when it lands exactly on the
     # horizon, so this must run before the depth<=0 leaf return. The key is only computed
