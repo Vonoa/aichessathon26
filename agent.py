@@ -1,11 +1,17 @@
 """The submission entrypoint. The platform imports this file and calls get_move."""
 
 import time
+import traceback
 from collections.abc import Hashable
 
 import chess
 
 from search import search_move
+
+# Bump this on every upload. It prints once at import, so the per-game log the platform
+# keeps names exactly which build played that game.
+BUILD = "diag-2 (jit eval, per-move logging, fixed move label)"
+print(f"agent build: {BUILD}", flush=True)
 
 # Import time runs once per game, inside a 90 second budget, before your clock starts.
 # Load weights and build tables out here, not inside get_move. Warm every numba-jitted
@@ -41,8 +47,12 @@ def get_move(fen: str, time_left_ms: int) -> str:
     started = time.monotonic()
     try:
         return search_move(board, time_left_ms, _history, increment_ms)
-    except Exception:
+    except Exception as exc:
         # A bug in the search must never forfeit the game: fall back to any legal move.
+        # Print the failure so a rated game that hits this path can be diagnosed -- the
+        # platform keeps stderr, and a silent fallback would leave no trace.
+        print(f"FALLBACK on {fen!r}: {type(exc).__name__}: {exc}", flush=True)
+        traceback.print_exc()
         legal = list(board.legal_moves)
         return legal[0].uci() if legal else "0000"
     finally:
