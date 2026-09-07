@@ -1,0 +1,70 @@
+{
+  "timestamp": 1788822717.3100388,
+  "duration_s": 2.760708808898926,
+  "git_commit": "d60f28748ef78e38e163a02c3b236a9ee432fb29",
+  "dataset_path": "versions/phase7/labelled_selfplay.tsv",
+  "dataset_hash": "241fca8bc7ca38de",
+  "dataset_size": 1435,
+  "n_train": 1292,
+  "n_val": 143,
+  "hyperparameters": {
+    "epochs": 10,
+    "batch_size": 256,
+    "lr": 0.001,
+    "seed": 0,
+    "val_fraction": 0.1
+  },
+  "history": [
+    {
+      "epoch": 0,
+      "train_loss": 0.060201239890358395,
+      "val_loss": 0.056509364396333694
+    },
+    {
+      "epoch": 1,
+      "train_loss": 0.055866386095529,
+      "val_loss": 0.05258113145828247
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.04941747774119163,
+      "val_loss": 0.046137697994709015
+    },
+    {
+      "epoch": 3,
+      "train_loss": 0.03924385534351455,
+      "val_loss": 0.038196463137865067
+    },
+    {
+      "epoch": 4,
+      "train_loss": 0.028977345640629808,
+      "val_loss": 0.03199056535959244
+    },
+    {
+      "epoch": 5,
+      "train_loss": 0.02164935756578534,
+      "val_loss": 0.029003944247961044
+    },
+    {
+      "epoch": 6,
+      "train_loss": 0.017864427947361403,
+      "val_loss": 0.028142988681793213
+    },
+    {
+      "epoch": 7,
+      "train_loss": 0.016548296759602826,
+      "val_loss": 0.02355976030230522
+    },
+    {
+      "epoch": 8,
+      "train_loss": 0.013467422533699603,
+      "val_loss": 0.023932622745633125
+    },
+    {
+      "epoch": 9,
+      "train_loss": 0.013216036517495987,
+      "val_loss": 0.023142581805586815
+    }
+  ],
+  "checkpoint_path": "versions\\phase7\\runs\\model.pt"
+}
