@@ -11,10 +11,11 @@ correct and produces sane scores before any tuning. texel_tune.py owns setting t
 numbers -- do not hand-adjust these from watching games. Register any new table you add
 here in texel_tune.py's get_tunable_tables() or it silently won't get tuned.
 
-NOT YET JITTED. This uses python-chess objects (piece_map(), pieces(), attacks_mask())
-for clarity while the weights are still being tuned -- tune this version first, since it's
-far easier to debug than numba, then port the tuned tables into Phase 3's jitted bitboard
-eval. Don't tune the jitted version directly.
+evaluate() runs the numba-jitted path (_evaluate_jit, built from the kernels in the
+"Jitted evaluation" section). _evaluate_reference() is the pure-python equivalent, kept
+verbatim as the oracle for tests/test_engine.py's golden values and the equivalence test
+in tests/test_evaljit.py. Tune against _evaluate_reference (easy to debug); the jitted
+kernels read the same PST_MG/PST_EG/PIECE_VALUES tables, so a retune flows through both.
 
 Returned score is from the side-to-move's point of view (negamax convention), matching
 search.py's expectations exactly as the current evaluate.py does.
@@ -342,8 +343,8 @@ _PIECE_TYPES = (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN,
 #   2  jitted material + tapered PST                                       [done]
 #   3  jitted pawn structure (doubled / isolated / passed)                 [done]
 #   4  jitted mobility + king safety (via _ray_attacks -- the speed win)   [done]
-#   5  evaluate() calls the jitted path; this file's old body becomes the
-#      _evaluate_reference used by tests/test_engine.py's golden values.
+#   5  evaluate() calls the jitted path (_evaluate_jit); the old body is    [done]
+#      _evaluate_reference, the oracle for the golden + equivalence tests.
 # Each kernel is pinned against the Python eval above by tests/test_evaljit.py.
 # ---------------------------------------------------------------------------
 
@@ -726,6 +727,34 @@ def _king_safety_jit(
     )
 
 
+@njit(cache=False)
+def _evaluate_jit(
+    pieces: npt.NDArray[np.uint64],
+    occ: npt.NDArray[np.uint64],
+    white_king: int,
+    black_king: int,
+    white_to_move: bool,
+) -> int:
+    """Full tapered eval, side-to-move relative -- the jitted equivalent of
+    _evaluate_reference()'s body (minus the stalemate / insufficient-material guard,
+    which the Python wrapper still does). Assembly matches the reference exactly:
+    king safety enters mg only; pawn structure enters both mg and eg.
+    """
+    phase = _game_phase_jit(pieces)
+    material_mg, material_eg = _material_pst(pieces, _PIECE_VALUE_ARR, _PST_MG, _PST_EG)
+    pawn = _pawn_structure_jit(pieces)
+    mob_mg, mob_eg = _mobility_jit(pieces, occ)
+    king_safety = _king_safety_jit(pieces, occ, white_king, black_king)
+
+    mg_total = material_mg + pawn + mob_mg + king_safety
+    eg_total = material_eg + pawn + mob_eg
+    blended = mg_total * phase + eg_total * (24 - phase)
+    tapered = int(blended / 24)
+    if white_to_move:
+        return tapered
+    return -tapered
+
+
 def _warm_up() -> None:
     """Compile the jitted kernels at import, with the exact dtypes the search feeds
     them, so numba never compiles on the clock (its `/tmp` cache is wiped per game).
@@ -740,17 +769,18 @@ def _warm_up() -> None:
     _pawn_structure_jit(pieces)
     _mobility_jit(pieces, occ)
     _king_safety_jit(pieces, occ, 4, 60)  # e1 / e8 kings of the start position
+    _evaluate_jit(pieces, occ, 4, 60, True)
 
 
 _warm_up()
 
 
-def evaluate(board: chess.Board) -> int:
-    """Tapered eval, centipawns, from side-to-move's perspective (negamax convention).
+def _evaluate_reference(board: chess.Board) -> int:
+    """Pure-python tapered eval -- the oracle evaluate() (the jitted path) is checked
+    against. Kept verbatim; tune weights here, and register new tables in texel_tune.py.
 
-    The search never calls this on a checkmate (it returns a mate score for a node with no
-    legal moves), so there is no is_checkmate() guard here - it would be a wasted movegen
-    at every leaf.
+    Tapered eval, centipawns, from side-to-move's perspective (negamax convention). The
+    search never calls this on a checkmate, so there is no is_checkmate() guard here.
     """
     if board.is_stalemate() or board.is_insufficient_material():
         return 0
@@ -797,3 +827,23 @@ def evaluate(board: chess.Board) -> int:
     tapered = int(blended / TOTAL_PHASE)
 
     return tapered if board.turn == chess.WHITE else -tapered
+
+
+def evaluate(board: chess.Board) -> int:
+    """Tapered eval, centipawns, from the side-to-move's point of view (negamax
+    convention). Runs the numba-jitted path; _evaluate_reference() is the pure-python
+    equivalent, kept as the golden-test oracle.
+
+    The search never calls this on a checkmate (a node with no legal moves returns a mate
+    score), so there is no is_checkmate() guard -- it would be a wasted movegen per leaf.
+    """
+    if board.is_stalemate() or board.is_insufficient_material():
+        return 0
+
+    white_king = board.king(chess.WHITE)
+    black_king = board.king(chess.BLACK)
+    if white_king is None or black_king is None:
+        return _evaluate_reference(board)  # not a legal search position; stay safe
+
+    pieces, occ, white_to_move = _encode(board)
+    return int(_evaluate_jit(pieces, occ, white_king, black_king, white_to_move))

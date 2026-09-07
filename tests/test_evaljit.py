@@ -286,3 +286,41 @@ def test_mobility_and_king_safety_jit_are_colour_symmetric() -> None:
         ks = evaluate._king_safety_jit(pieces, occ, wk, bk)
         ks_mirror = evaluate._king_safety_jit(mpieces, mocc, mwk, mbk)
         assert ks == -ks_mirror
+
+
+# --- step 5: evaluate() runs the jitted path ------------------------------------
+
+# Every FEN this file exercises, plus the test_engine.py golden set, plus terminal
+# positions so the stalemate / insufficient-material guard and the kingless fallback
+# are covered too.
+_EQUIV_FENS = [
+    *dict.fromkeys(_OCC_FENS + _EVAL_FENS + _PAWN_FENS + _MOB_KS_FENS),
+    "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c6 0 2",
+    "r1b1k2r/ppppqppp/2n2n2/2b5/4P3/2N2N2/PPPP1PPP/R1BQK2R w KQkq - 6 6",
+    "7k/8/8/8/8/8/8/5B1K w - - 0 1",       # KB vs K: insufficient material -> 0
+    "8/8/8/8/8/5k2/5p2/5K2 w - - 0 1",     # stalemate for White -> 0
+    "4k3/8/8/8/8/8/8/4K2R w - - 0 1",      # KR vs K, not terminal
+    "8/8/8/4k3/8/2K5/8/8 w - - 0 1",       # bare kings (insufficient) -> 0
+]
+
+
+@pytest.mark.parametrize("fen", _EQUIV_FENS)
+def test_evaluate_matches_reference(fen: str) -> None:
+    board = chess.Board(fen)
+    assert evaluate.evaluate(board) == evaluate._evaluate_reference(board)
+
+
+@pytest.mark.parametrize("fen", _EQUIV_FENS)
+def test_evaluate_matches_reference_mirrored(fen: str) -> None:
+    board = chess.Board(fen).mirror()
+    assert evaluate.evaluate(board) == evaluate._evaluate_reference(board)
+
+
+def test_evaluate_still_side_to_move_relative() -> None:
+    # A position and the same position with the other side to move negate.
+    for fen in ("r1bq1rk1/pp2bppp/2n1pn2/2pp4/3P1B2/2PBPN2/PP1N1PPP/R2Q1RK1 w - - 0 9",
+                "2r3k1/5ppp/p7/1p1Pp3/8/1P3N2/P4PPP/3R2K1 b - - 0 1"):
+        board = chess.Board(fen)
+        flipped = board.copy()
+        flipped.turn = not board.turn
+        assert evaluate.evaluate(board) == -evaluate.evaluate(flipped)
