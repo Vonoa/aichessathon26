@@ -70,6 +70,27 @@ uv run python -m harness.arena --agent . --opponent versions\phase5eval   # stre
   confirm it lists `agent.py`/`search.py`/`evaluate.py`, then upload `submission.zip`.
 - If `uv` isn't on PATH, use `.\.venv\Scripts\python.exe -m ruff` etc., or open a new shell.
 
+## Updating the submission zip — do this, and tell the user
+
+Claude cannot upload. Only the user can, on the dashboard. So the rule is:
+
+**Whenever a change that improves playing strength lands on `main`** (a merged bug fix, a
+measured arena win, a completed phase — not docs/tests/tooling), on updated `main` run:
+
+```
+uv run python -m harness.package
+```
+
+confirm the output lists `agent.py` + `search.py` + `evaluate.py` and the smoke run passes,
+then **explicitly tell the user**: *"submission.zip is rebuilt with <what changed> — upload
+it on the dashboard."* Say it every time; do not let a strength gain sit un-uploaded.
+
+After they upload, ask for the validation log and check it ends in `valid`. 10 uploads per
+team per day, the latest valid one plays, so re-uploading often costs nothing.
+
+**Currently un-uploaded on the live agent:** check-extension and LMR (both merged, both
+measured flat, low priority). Upload after the eval jit lands — that will be a real jump.
+
 ## Gotchas
 
 - **PeSTO tables in `evaluate.py` are `_flip_ranks`'d at import** — they're written rank-8-
