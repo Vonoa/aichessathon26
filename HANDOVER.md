@@ -46,6 +46,30 @@ output must match the current eval, or a small delta is consciously documented.
 5. **Swap `evaluate()` to the jitted path**; keep the old body as `_evaluate_reference`
    for the golden test. Bench + arena vs `versions/phase5eval`.
 
+## How to test a change (run every time, in this order)
+
+```
+uv run ruff check .          # lint
+uv run mypy                   # types (our 3 files only)
+uv run pytest -q              # 37 unit tests, ~1 s
+uv run python -m tools.bench  # nodes/sec + depth on 3 fixed positions
+uv run python -m harness.arena --agent . --opponent versions\phase5eval   # strength, 16 seeded games + 95% CI
+```
+
+`make gate` = ruff + mypy + pytest + 2 must-finish games. CI runs it on every PR.
+
+**Rules of the loop:**
+- A **pure speed change** (like the jit) must not move eval output: `test_eval_golden_values`
+  (the `_EVAL_GOLDEN` dict in `tests/test_engine.py`) must still pass. If a term is
+  genuinely reworked, re-capture the goldens and say why in the commit.
+- **bench** is the "did it get faster" check — compare nodes/sec and depth before/after.
+- **arena vs `versions/phase5eval`** is the "did it get stronger" check. 16 games has a
+  wide CI (~±20%); a change is real only if the Elo interval clears 0. For a close call,
+  run `--games 60` or more.
+- Before any upload: `uv run python -m harness.package` (builds *and* smoke-runs the zip),
+  confirm it lists `agent.py`/`search.py`/`evaluate.py`, then upload `submission.zip`.
+- If `uv` isn't on PATH, use `.\.venv\Scripts\python.exe -m ruff` etc., or open a new shell.
+
 ## Gotchas
 
 - **PeSTO tables in `evaluate.py` are `_flip_ranks`'d at import** — they're written rank-8-
