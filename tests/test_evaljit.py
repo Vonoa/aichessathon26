@@ -202,3 +202,87 @@ def test_pawn_structure_jit_is_colour_symmetric() -> None:
         pieces, _o, _t = evaluate._encode(board)
         mpieces, _o2, _t2 = evaluate._encode(board.mirror())
         assert evaluate._pawn_structure_jit(pieces) == -evaluate._pawn_structure_jit(mpieces)
+
+
+# --- step 4: mobility + king safety ----------------------------------------------
+
+# Positions with pieces bearing on the king zone and varied mobility.
+_MOB_KS_FENS = [
+    *_EVAL_FENS,
+    "r3k2r/pppq1ppp/2np1n2/2b1p1B1/2B1P1b1/2NP1N2/PPPQ1PPP/R3K2R w KQkq - 0 1",
+    "r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/2N2N2/PPPP1PPP/R1BQ1RK1 b kq - 5 5",
+    "6k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1",           # rook on an open file
+    "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N1P/1PP1QPP1/R4RK1 w - - 0 11",
+    "2r3k1/5ppp/p7/1p1Pp3/8/1P3N2/P4PPP/3R2K1 b - - 0 1",
+    "8/2k5/8/8/8/8/5K2/6R1 w - - 0 1",               # bare-ish, exposed kings
+]
+
+
+@pytest.mark.parametrize("fen", _MOB_KS_FENS)
+def test_mobility_side_matches_reference(fen: str) -> None:
+    board = chess.Board(fen)
+    pieces, occ, _turn = evaluate._encode(board)
+    for colour in (chess.WHITE, chess.BLACK):
+        got = evaluate._mobility_side(pieces, occ[2], 0 if colour == chess.WHITE else 1)
+        assert tuple(got) == evaluate._mobility(board, colour)
+
+
+@pytest.mark.parametrize("fen", _MOB_KS_FENS)
+def test_mobility_jit_matches_reference(fen: str) -> None:
+    board = chess.Board(fen)
+    pieces, occ, _turn = evaluate._encode(board)
+    white_mg, white_eg = evaluate._mobility(board, chess.WHITE)
+    black_mg, black_eg = evaluate._mobility(board, chess.BLACK)
+    got = evaluate._mobility_jit(pieces, occ)
+    assert tuple(got) == (white_mg - black_mg, white_eg - black_eg)
+
+
+@pytest.mark.parametrize("fen", _MOB_KS_FENS)
+def test_king_safety_side_matches_reference(fen: str) -> None:
+    board = chess.Board(fen)
+    pieces, occ, _turn = evaluate._encode(board)
+    white = board.occupied_co[chess.WHITE]
+    black = board.occupied_co[chess.BLACK]
+    white_king = board.king(chess.WHITE)
+    black_king = board.king(chess.BLACK)
+    assert white_king is not None and black_king is not None
+    assert evaluate._king_safety_side(pieces, occ[2], white_king, 0) == (
+        evaluate._king_safety_mg(board, white_king, chess.WHITE, white, black)
+    )
+    assert evaluate._king_safety_side(pieces, occ[2], black_king, 1) == (
+        evaluate._king_safety_mg(board, black_king, chess.BLACK, white, black)
+    )
+
+
+@pytest.mark.parametrize("fen", _MOB_KS_FENS)
+def test_king_safety_jit_matches_reference(fen: str) -> None:
+    board = chess.Board(fen)
+    pieces, occ, _turn = evaluate._encode(board)
+    white = board.occupied_co[chess.WHITE]
+    black = board.occupied_co[chess.BLACK]
+    white_king = board.king(chess.WHITE)
+    black_king = board.king(chess.BLACK)
+    assert white_king is not None and black_king is not None
+    ref = evaluate._king_safety_mg(
+        board, white_king, chess.WHITE, white, black
+    ) - evaluate._king_safety_mg(board, black_king, chess.BLACK, white, black)
+    assert evaluate._king_safety_jit(pieces, occ, white_king, black_king) == ref
+
+
+def test_mobility_and_king_safety_jit_are_colour_symmetric() -> None:
+    for fen in _MOB_KS_FENS:
+        board = chess.Board(fen)
+        mirror = board.mirror()
+        pieces, occ, _t = evaluate._encode(board)
+        mpieces, mocc, _t2 = evaluate._encode(mirror)
+        wk, bk = board.king(chess.WHITE), board.king(chess.BLACK)
+        mwk, mbk = mirror.king(chess.WHITE), mirror.king(chess.BLACK)
+        assert wk is not None and bk is not None and mwk is not None and mbk is not None
+
+        mob = evaluate._mobility_jit(pieces, occ)
+        mob_mirror = evaluate._mobility_jit(mpieces, mocc)
+        assert tuple(mob) == tuple(-v for v in mob_mirror)
+
+        ks = evaluate._king_safety_jit(pieces, occ, wk, bk)
+        ks_mirror = evaluate._king_safety_jit(mpieces, mocc, mwk, mbk)
+        assert ks == -ks_mirror

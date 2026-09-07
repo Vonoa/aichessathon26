@@ -341,7 +341,7 @@ _PIECE_TYPES = (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN,
 #   1  _encode + _ray_attacks + import-time warm-up                        [done]
 #   2  jitted material + tapered PST                                       [done]
 #   3  jitted pawn structure (doubled / isolated / passed)                 [done]
-#   4  jitted mobility + king safety (via _ray_attacks -- the speed win)
+#   4  jitted mobility + king safety (via _ray_attacks -- the speed win)   [done]
 #   5  evaluate() calls the jitted path; this file's old body becomes the
 #      _evaluate_reference used by tests/test_engine.py's golden values.
 # Each kernel is pinned against the Python eval above by tests/test_evaljit.py.
@@ -588,18 +588,158 @@ def _pawn_structure_jit(pieces: npt.NDArray[np.uint64]) -> int:
     )
 
 
+# --- step 4: mobility + king safety --------------------------------------------
+#
+# The speed win: evaluate()'s _mobility and _king_safety_mg call board.attacks_mask()
+# ~24x per leaf (python-chess slider rays); here it is a jitted _ray_attacks loop.
+# Weights indexed by piece type 0=pawn..5=king (0 where the term does not apply).
+_MOBILITY_MG_ARR: npt.NDArray[np.int16] = np.array(
+    [0, MOBILITY_MG[chess.KNIGHT], MOBILITY_MG[chess.BISHOP],
+     MOBILITY_MG[chess.ROOK], MOBILITY_MG[chess.QUEEN], 0], dtype=np.int16,
+)
+_MOBILITY_EG_ARR: npt.NDArray[np.int16] = np.array(
+    [0, MOBILITY_EG[chess.KNIGHT], MOBILITY_EG[chess.BISHOP],
+     MOBILITY_EG[chess.ROOK], MOBILITY_EG[chess.QUEEN], 0], dtype=np.int16,
+)
+_ATTACKER_WEIGHT_ARR: npt.NDArray[np.int16] = np.array(
+    [ATTACKER_ZONE_WEIGHT[chess.PAWN], ATTACKER_ZONE_WEIGHT[chess.KNIGHT],
+     ATTACKER_ZONE_WEIGHT[chess.BISHOP], ATTACKER_ZONE_WEIGHT[chess.ROOK],
+     ATTACKER_ZONE_WEIGHT[chess.QUEEN], 0], dtype=np.int16,
+)
+_KING_ZONE_ARR: npt.NDArray[np.uint64] = np.array(_KING_ZONE, dtype=np.uint64)
+# Shield / pawn-attack tables in this file's colour order: index 0 = White, 1 = Black.
+_SHIELD_ARR: npt.NDArray[np.uint64] = np.array(
+    [_WHITE_SHIELD, _BLACK_SHIELD], dtype=np.uint64
+)
+_PAWN_ATTACKS_ARR: npt.NDArray[np.uint64] = np.array(
+    [list(chess.BB_PAWN_ATTACKS[chess.WHITE]), list(chess.BB_PAWN_ATTACKS[chess.BLACK])],
+    dtype=np.uint64,
+)
+
+
+@njit(cache=False)
+def _piece_attacks(occ_all: np.uint64, sq: int, pt: int) -> np.uint64:
+    """attacks_mask for a non-pawn piece type: 1=knight, 2=bishop, 3=rook, 4=queen."""
+    if pt == 1:
+        return np.uint64(_KNIGHT_ATTACKS[sq])
+    if pt == 2:
+        return _ray_attacks(occ_all, sq, _BISHOP_DIRS)
+    if pt == 3:
+        return _ray_attacks(occ_all, sq, _ROOK_DIRS)
+    return _ray_attacks(occ_all, sq, _QUEEN_DIRS)
+
+
+@njit(cache=False)
+def _mobility_side(
+    pieces: npt.NDArray[np.uint64], occ_all: np.uint64, colour: int
+) -> tuple[int, int]:
+    """(mg, eg) mobility for one side: attack-square count per N/B/R/Q times its weight,
+    mirroring evaluate._mobility (which counts every attacked square, own pieces included).
+    """
+    mg = 0
+    eg = 0
+    for pt in range(1, 5):  # KNIGHT, BISHOP, ROOK, QUEEN
+        wmg = int(_MOBILITY_MG_ARR[pt])
+        weg = int(_MOBILITY_EG_ARR[pt])
+        bb = pieces[colour, pt]
+        while bb != np.uint64(0):
+            lsb = bb & (~bb + np.uint64(1))
+            sq = int(_popcount(lsb - np.uint64(1)))
+            att = _piece_attacks(occ_all, sq, pt)
+            n = int(_popcount(att))
+            mg += wmg * n
+            eg += weg * n
+            bb &= bb - np.uint64(1)
+    return mg, eg
+
+
+@njit(cache=False)
+def _mobility_jit(
+    pieces: npt.NDArray[np.uint64], occ: npt.NDArray[np.uint64]
+) -> tuple[int, int]:
+    """(mg, eg) = White mobility minus Black's -- the sign*mob combination evaluate() folds
+    into mg_score and eg_score respectively."""
+    all_occ = occ[2]
+    white_mg, white_eg = _mobility_side(pieces, all_occ, 0)
+    black_mg, black_eg = _mobility_side(pieces, all_occ, 1)
+    return int(white_mg - black_mg), int(white_eg - black_eg)
+
+
+@njit(cache=False)
+def _king_safety_side(
+    pieces: npt.NDArray[np.uint64], occ_all: np.uint64, king_sq: int, colour: int
+) -> int:
+    """MG-scale king safety for one side, mirroring evaluate._king_safety_mg: pawn shield,
+    open / semi-open files beside the king, and enemy attacker-zone pressure. The caller
+    fades this by game phase.
+    """
+    own_pawns = pieces[colour, 0]
+    enemy = 1 - colour
+    enemy_pawns = pieces[enemy, 0]
+    score = 0
+
+    shield = _SHIELD_ARR[colour, king_sq]
+    score += SHIELD_PAWN_BONUS * int(_popcount(own_pawns & shield))
+
+    king_file = king_sq % 8
+    for nf in range(king_file - 1, king_file + 2):
+        if nf < 0 or nf > 7:
+            continue
+        file_mask = _FILE_MASK_ARR[nf]
+        has_own = (own_pawns & file_mask) != np.uint64(0)
+        has_enemy = (enemy_pawns & file_mask) != np.uint64(0)
+        if not has_own and not has_enemy:
+            score += OPEN_FILE_PENALTY
+        elif not has_own and has_enemy:
+            score += SEMI_OPEN_FILE_PENALTY
+
+    zone = _KING_ZONE_ARR[king_sq]
+    for pt in range(5):  # PAWN, KNIGHT, BISHOP, ROOK, QUEEN
+        weight = int(_ATTACKER_WEIGHT_ARR[pt])
+        bb = pieces[enemy, pt]
+        while bb != np.uint64(0):
+            lsb = bb & (~bb + np.uint64(1))
+            sq = int(_popcount(lsb - np.uint64(1)))
+            # both branches are uint64, so the ternary is numba-safe here (unlike a
+            # ternary that mixes an int with a promoted-to-float shift result)
+            att = _PAWN_ATTACKS_ARR[enemy, sq] if pt == 0 else _piece_attacks(occ_all, sq, pt)
+            if (att & zone) != np.uint64(0):
+                score -= weight
+            bb &= bb - np.uint64(1)
+
+    return int(score)
+
+
+@njit(cache=False)
+def _king_safety_jit(
+    pieces: npt.NDArray[np.uint64],
+    occ: npt.NDArray[np.uint64],
+    white_king: int,
+    black_king: int,
+) -> int:
+    """White king safety minus Black's (MG-scale, unfaded). evaluate() adds this to
+    mg_score only, then the phase blend fades it toward 0 in the endgame."""
+    all_occ = occ[2]
+    return int(
+        _king_safety_side(pieces, all_occ, white_king, 0)
+        - _king_safety_side(pieces, all_occ, black_king, 1)
+    )
+
+
 def _warm_up() -> None:
     """Compile the jitted kernels at import, with the exact dtypes the search feeds
     them, so numba never compiles on the clock (its `/tmp` cache is wiped per game).
     """
-    occ = np.uint64(0x00FF00000000FF00)
+    occ_scalar = np.uint64(0x00FF00000000FF00)
     for dirs in (_BISHOP_DIRS, _ROOK_DIRS, _QUEEN_DIRS):
-        _ray_attacks(occ, 27, dirs)
-    pieces, _occ, _turn = _encode(chess.Board())
+        _ray_attacks(occ_scalar, 27, dirs)
+    pieces, occ, _turn = _encode(chess.Board())
     _popcount(np.uint64(0xFFFF00000000FFFF))
     _game_phase_jit(pieces)
     _eval_material_pst_tapered(pieces, _PIECE_VALUE_ARR, _PST_MG, _PST_EG)
     _pawn_structure_jit(pieces)
+    _mobility_jit(pieces, occ)
+    _king_safety_jit(pieces, occ, 4, 60)  # e1 / e8 kings of the start position
 
 
 _warm_up()
