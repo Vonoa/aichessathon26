@@ -93,13 +93,29 @@ def outcome_to_result(board: chess.Board) -> float:
     return {"1-0": 1.0, "0-1": 0.0, "1/2-1/2": 0.5}.get(result, 0.5)
 
 
-def generate_dataset(n_games: int, out_path: str, get_move_fn, seed: int = 0) -> None:
+def generate_dataset(
+    n_games: int,
+    out_path: str,
+    get_move_fn,
+    seed: int = 0,
+    time_left_ms: int = 1000,
+    reset_fn=None,
+) -> None:
+    """reset_fn, if given, is called before each simulated game. Required when
+    get_move_fn wraps a module with cross-move state meant to persist for one real
+    game (agent.py's `_history` / `_clock` globals) -- without resetting it, that
+    state leaks between the independent games generated here and corrupts
+    repetition detection and increment inference for every game after the first."""
     rng = random.Random(seed)
     with open(out_path, "w") as f:
         for game_id in range(n_games):
+            if reset_fn is not None:
+                reset_fn()
             board = play_random_opening(rng)
             fens = [board.fen()]
-            fens += continue_with_engine(board, get_move_fn, rng)
+            fens += continue_with_engine(
+                board, get_move_fn, rng, time_left_ms=time_left_ms
+            )
             result = outcome_to_result(board)
             for fen in fens:
                 f.write(f"{game_id}\t{fen}\t{result}\n")
@@ -107,7 +123,34 @@ def generate_dataset(n_games: int, out_path: str, get_move_fn, seed: int = 0) ->
                 print(f"generated {game_id}/{n_games} games", file=sys.stderr)
 
 
-import sys
-sys.path.insert(0, "../..")
-import agent
-generate_dataset(n_games=..., out_path="raw_positions.tsv", get_move_fn=agent.get_move)
+if __name__ == "__main__":
+    import argparse
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--games", type=int, default=150)
+    parser.add_argument("--out", default="raw_positions_selfplay.tsv")
+    parser.add_argument("--time-ms", type=int, default=1000,
+                         help="fake clock handed to the real agent for each generated "
+                              "move -- small on purpose, this is bulk data generation, "
+                              "not a real game")
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args()
+
+    repo_root = Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(repo_root))
+    import agent  # noqa: E402  (path must be set up first)
+
+    def _reset_agent_state() -> None:
+        agent._history.clear()
+        agent._clock.clear()
+
+    generate_dataset(
+        n_games=args.games,
+        out_path=args.out,
+        get_move_fn=agent.get_move,
+        seed=args.seed,
+        time_left_ms=args.time_ms,
+        reset_fn=_reset_agent_state,
+    )
+    print(f"wrote {args.out}")

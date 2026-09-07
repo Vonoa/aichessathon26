@@ -65,6 +65,49 @@ def label_dataset(
             fout.write(f"{fen}\t{target:.6f}\n")
 
 
+def make_engine_shallow_eval(depth: int = 3, clip_cp: float = 3000.0):
+    """The real shallow eval this file's docstring calls for: your own engine's
+    search.py at a low, fixed depth (not time-limited -- a depth cap is what
+    keeps this 'shallow' regardless of machine speed). Mate scores are clipped
+    to clip_cp before the sigmoid conversion in label_dataset, since an
+    unclipped mate score (+-1,000,000) overflows math.exp there.
+
+    Reaches into search.py's module-level globals (_tt/_killers/_hist/_seen)
+    the same way search_move() does, and resets them before every call --
+    labelling calls are on independent positions, so nothing should carry
+    over between them the way search state carries across moves in one game.
+    """
+    import sys
+    import time
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[2]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    import search as engine_search
+
+    def _eval(fen: str) -> float:
+        board = chess.Board(fen)
+        legal = list(board.legal_moves)
+        if not legal:
+            return 0.0  # checkmate/stalemate; the outcome label already carries this
+
+        engine_search._nodes = 0
+        engine_search._seen = frozenset()
+        engine_search._tt.clear()
+        engine_search._killers[:] = [None] * len(engine_search._killers)
+        engine_search._hist[:] = [0] * 4096
+
+        deadline = time.monotonic() + 30.0  # depth-capped, not time-capped; just a safety net
+        _, score = engine_search._search_root(board, depth, deadline, legal[0])
+        score = max(-clip_cp, min(clip_cp, float(score)))
+        # _search_root's score is relative to the side to move; sigmoid_to_wdl
+        # expects centipawns from White's POV.
+        return score if board.turn == chess.WHITE else -score
+
+    return _eval
+
+
 def make_material_shallow_eval():
     """Placeholder shallow eval so this file runs standalone for a smoke test:
     material count only, no search. Replace with a real shallow-depth engine
@@ -85,13 +128,20 @@ def make_material_shallow_eval():
 
 
 if __name__ == "__main__":
-    import sys
+    import argparse
 
-    if len(sys.argv) != 3:
-        print("usage: python label.py <deduped.tsv> <labelled.tsv>")
-        print("NOTE: uses a material-only placeholder eval -- swap in a real")
-        print("shallow-depth engine call before using this for real training.")
-        sys.exit(1)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("in_path", help="deduped.tsv from dedupe.py")
+    parser.add_argument("out_path", help="where to write labelled.tsv")
+    parser.add_argument("--blend-weight-outcome", type=float, default=0.5)
+    parser.add_argument("--material-only", action="store_true",
+                         help="use the material-only placeholder eval instead of a real "
+                              "shallow search -- for smoke tests only, not real training")
+    parser.add_argument("--depth", type=int, default=3,
+                         help="depth of the shallow engine search used as the label's "
+                              "eval-component signal")
+    args = parser.parse_args()
 
-    label_dataset(sys.argv[1], sys.argv[2], make_material_shallow_eval())
-    print(f"wrote {sys.argv[2]}")
+    eval_fn = make_material_shallow_eval() if args.material_only else make_engine_shallow_eval(depth=args.depth)
+    label_dataset(args.in_path, args.out_path, eval_fn, blend_weight_outcome=args.blend_weight_outcome)
+    print(f"wrote {args.out_path}")
