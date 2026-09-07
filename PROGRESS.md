@@ -204,3 +204,24 @@ definitions live in [docs/PLAN.md](docs/PLAN.md).
   blindness (folds into 5b), qsearch has no delta pruning (with the pruning stack), dirty
   board after `_Timeout` (latent), TT path-dependent draw (persistent-TT step), history
   cap (after 3e), and that Phase 4b's gain is unproven on 20-game samples.
+
+### 2026-09-07 — Jit the eval, step 1: encode + ray attacks + warm-up (branch `jit-eval`)
+
+- The search is eval-cost-bound: the Phase 5 tapered eval is ~28x slower than the old
+  material eval (~114 us/call), middlegame depth stuck at 2-3. The jit is the unlock.
+  Building it in five verifiable increments (one commit each) against the golden-value
+  test in `tests/test_engine.py`; see `HANDOVER.md` for the plan.
+- Step 1 adds the scaffold to `evaluate.py`, `evaluate()` itself untouched:
+  - `_encode(board)` -> `(pieces[2,6] uint64, occ[3] uint64, turn)`, built once per call.
+  - `@njit _ray_attacks(occ, sq, dirs)` -- classical ray loop, indexes a `_BB_SQUARES`
+    uint64 table instead of numba-fragile `1 << sq` shifts; includes the blocker square
+    like `board.attacks_mask()`. `_BISHOP/_ROOK/_QUEEN_DIRS` as (file, rank) step pairs.
+  - `_KNIGHT_ATTACKS` / `_KING_ATTACKS` uint64[64], copied from `chess.BB_*_ATTACKS`.
+  - `_warm_up()` runs at import (all three dir sets, real dtypes) so numba compiles in the
+    90 s budget, not on the clock. `import evaluate` is ~2.5 s; move-1 budget test still green.
+- `tests/test_evaljit.py`: `_ray_attacks` matches python-chess's `BB_DIAG/RANK/FILE`
+  lookup for every square across 5 occupancies; leaper + `_BB_SQUARES` tables match;
+  `_encode` round-trips. 41 tests pass, ruff + mypy strict clean (numba added to the
+  mypy `ignore_missing_imports` override).
+- PROGRESS.md gap noted in `audit.md` (no entries for Phase 5 eval / contempt / check-ext /
+  LMR / harness merge) is still open -- backfill on a separate pass.

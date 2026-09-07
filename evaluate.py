@@ -21,6 +21,9 @@ search.py's expectations exactly as the current evaluate.py does.
 """
 
 import chess
+import numpy as np
+import numpy.typing as npt
+from numba import njit
 
 # ---------------------------------------------------------------------------
 # Material (centipawns).
@@ -330,6 +333,96 @@ def _king_safety_mg(board: chess.Board, king_sq: int, color: bool, white: int, b
 
 
 _PIECE_TYPES = (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING)
+
+
+# ---------------------------------------------------------------------------
+# Jitted evaluation, step 1: board encoding + classical ray attacks + warm-up.
+#
+# The tapered eval above still runs the search (see evaluate()); this block is the
+# scaffold the jitted port is built on, one verifiable increment at a time:
+#   1 (here) _encode + _ray_attacks + import-time warm-up
+#   2        jitted material + tapered PST
+#   3        jitted pawn structure
+#   4        jitted mobility + king safety (via _ray_attacks -- the speed win)
+#   5        evaluate() calls the jitted path; this file's old body becomes the
+#            _evaluate_reference used by tests/test_engine.py's golden values.
+# ---------------------------------------------------------------------------
+
+# One uint64 per square, so the jitted code indexes a table instead of doing
+# width-fragile `1 << sq` shifts on numba's mixed int/uint types.
+_BB_SQUARES: npt.NDArray[np.uint64] = np.array(
+    [1 << sq for sq in range(64)], dtype=np.uint64
+)
+
+# Precomputed leaper attack sets, straight from python-chess so they match exactly.
+_KNIGHT_ATTACKS: npt.NDArray[np.uint64] = np.array(chess.BB_KNIGHT_ATTACKS, dtype=np.uint64)
+_KING_ATTACKS: npt.NDArray[np.uint64] = np.array(chess.BB_KING_ATTACKS, dtype=np.uint64)
+
+# Slider directions as (file step, rank step) pairs; a queen is the union of both.
+_BISHOP_DIRS: npt.NDArray[np.int64] = np.array(
+    [(1, 1), (1, -1), (-1, 1), (-1, -1)], dtype=np.int64
+)
+_ROOK_DIRS: npt.NDArray[np.int64] = np.array(
+    [(1, 0), (-1, 0), (0, 1), (0, -1)], dtype=np.int64
+)
+_QUEEN_DIRS: npt.NDArray[np.int64] = np.concatenate((_BISHOP_DIRS, _ROOK_DIRS))
+
+
+@njit(cache=False)
+def _ray_attacks(occ: np.uint64, sq: int, dirs: npt.NDArray[np.int64]) -> np.uint64:
+    """Classical slider attacks: step each direction from `sq` until off-board or a
+    blocker, and include that blocker square (a capture target, same as python-chess).
+    """
+    attacks = np.uint64(0)
+    f0 = sq % 8
+    r0 = sq // 8
+    for i in range(dirs.shape[0]):
+        df = dirs[i, 0]
+        dr = dirs[i, 1]
+        f = f0 + df
+        r = r0 + dr
+        while 0 <= f <= 7 and 0 <= r <= 7:
+            bit = _BB_SQUARES[r * 8 + f]
+            attacks |= bit
+            if (occ & bit) != np.uint64(0):
+                break
+            f += df
+            r += dr
+    return attacks
+
+
+def _encode(
+    board: chess.Board,
+) -> tuple[npt.NDArray[np.uint64], npt.NDArray[np.uint64], bool]:
+    """Board -> fixed arrays the jitted eval reads, built once per evaluate() call.
+
+    Returns:
+      pieces: shape (2, 6) uint64 -- pieces[colour][piece_type - 1] bitboard,
+              colour 0 = White, 1 = Black; piece_type is chess.PAWN..chess.KING.
+      occ:    shape (3,) uint64 -- [white occupancy, black occupancy, all occupancy].
+      turn:   True if White is to move (for the final side-to-move sign flip).
+    """
+    pieces = np.empty((2, 6), dtype=np.uint64)
+    for pt in range(1, 7):
+        pieces[0, pt - 1] = board.pieces_mask(pt, chess.WHITE)
+        pieces[1, pt - 1] = board.pieces_mask(pt, chess.BLACK)
+    occ = np.array(
+        [board.occupied_co[chess.WHITE], board.occupied_co[chess.BLACK], board.occupied],
+        dtype=np.uint64,
+    )
+    return pieces, occ, board.turn
+
+
+def _warm_up() -> None:
+    """Compile the jitted primitives at import, with the exact dtypes the search feeds
+    them, so numba never compiles on the clock (its `/tmp` cache is wiped per game).
+    """
+    occ = np.uint64(0x00FF00000000FF00)
+    for dirs in (_BISHOP_DIRS, _ROOK_DIRS, _QUEEN_DIRS):
+        _ray_attacks(occ, 27, dirs)
+
+
+_warm_up()
 
 
 def evaluate(board: chess.Board) -> int:
