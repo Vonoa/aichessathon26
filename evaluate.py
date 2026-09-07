@@ -170,13 +170,22 @@ KING_EG = [
     -53, -34, -21, -11, -28, -14, -24, -43,
 ]
 
+def _flip_ranks(table: list[int]) -> list[int]:
+    """The tables above are written rank 8 first (a8 = index 0), the PeSTO source layout.
+    This repo indexes squares a1 = 0, so flip the ranks once here to line them up.
+    """
+    return [table[(7 - sq // 8) * 8 + sq % 8] for sq in range(64)]
+
+
 PST_MG = {
-    chess.PAWN: PAWN_MG, chess.KNIGHT: KNIGHT_MG, chess.BISHOP: BISHOP_MG,
-    chess.ROOK: ROOK_MG, chess.QUEEN: QUEEN_MG, chess.KING: KING_MG,
+    chess.PAWN: _flip_ranks(PAWN_MG), chess.KNIGHT: _flip_ranks(KNIGHT_MG),
+    chess.BISHOP: _flip_ranks(BISHOP_MG), chess.ROOK: _flip_ranks(ROOK_MG),
+    chess.QUEEN: _flip_ranks(QUEEN_MG), chess.KING: _flip_ranks(KING_MG),
 }
 PST_EG = {
-    chess.PAWN: PAWN_EG, chess.KNIGHT: KNIGHT_EG, chess.BISHOP: BISHOP_EG,
-    chess.ROOK: ROOK_EG, chess.QUEEN: QUEEN_EG, chess.KING: KING_EG,
+    chess.PAWN: _flip_ranks(PAWN_EG), chess.KNIGHT: _flip_ranks(KNIGHT_EG),
+    chess.BISHOP: _flip_ranks(BISHOP_EG), chess.ROOK: _flip_ranks(ROOK_EG),
+    chess.QUEEN: _flip_ranks(QUEEN_EG), chess.KING: _flip_ranks(KING_EG),
 }
 
 # Pawn structure (centipawns).

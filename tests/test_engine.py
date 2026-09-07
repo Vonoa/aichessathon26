@@ -157,6 +157,19 @@ def test_eval_prefers_a_centralised_knight() -> None:
     assert evaluate.evaluate(centre) > evaluate.evaluate(rim)
 
 
+def test_pst_tables_are_oriented_a1_first() -> None:
+    # A pawn one step from promotion must score far above one on its home rank.
+    assert evaluate.PST_EG[chess.PAWN][chess.A7] > evaluate.PST_EG[chess.PAWN][chess.A2] + 100
+    # A midgame king belongs on the back rank, not marching up the board.
+    assert evaluate.PST_MG[chess.KING][chess.E1] > evaluate.PST_MG[chess.KING][chess.E5]
+
+
+def test_eval_wants_pawns_advanced() -> None:
+    advanced = chess.Board("4k3/P7/8/8/8/8/8/4K3 w - - 0 1")
+    home = chess.Board("4k3/8/8/8/8/8/P7/4K3 w - - 0 1")
+    assert evaluate.evaluate(advanced) > evaluate.evaluate(home) + 80
+
+
 def test_infers_increment_from_clock_deltas() -> None:
     assert agent._infer_increment(120_000) == 0.0  # no prior move yet
     agent._clock["prev"] = 120_000.0
