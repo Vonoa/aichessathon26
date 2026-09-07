@@ -1,7 +1,10 @@
-"""Jitted-eval step 1: board encoding, classical ray attacks, precomputed leaper tables.
+"""Jitted-eval increments, pinned against the Python eval in evaluate.py.
 
-These pin the numba primitives against python-chess's own attack tables before the
-tapered eval (evaluate.py) is ported onto them. tests/ is never packaged.
+step 1: board encoding, classical ray attacks, precomputed leaper tables
+step 2: material + tapered PST kernels
+step 3: pawn structure (doubled / isolated / passed)
+
+tests/ is never packaged.
 """
 
 import chess
@@ -152,3 +155,50 @@ def test_jitted_material_pst_is_colour_symmetric() -> None:
             mpieces, evaluate._PIECE_VALUE_ARR, evaluate._PST_MG, evaluate._PST_EG
         )
         assert forward == -mirrored
+
+
+# --- step 3: pawn structure --------------------------------------------------------
+
+# Positions that exercise doubled, isolated, blocked and clean passed pawns.
+_PAWN_FENS = [
+    chess.STARTING_FEN,
+    "4k3/8/8/3P4/8/8/8/4K3 w - - 0 1",          # lone white pawn: isolated + passed
+    "4k3/3p4/8/3P4/8/8/8/4K3 w - - 0 1",        # black d7 blocks it ahead: not passed
+    "4k3/8/8/8/8/3P4/3P4/4K3 w - - 0 1",        # white d2/d3: doubled + isolated
+    "4k3/pp3ppp/8/8/8/8/PP3PPP/4K3 w - - 0 1",  # symmetric wings, e/d files empty
+    "8/1p3pk1/p5p1/3P4/2P5/6P1/5K2/8 w - - 0 1",
+    "2r3k1/5ppp/p7/1p1Pp3/8/1P3N2/P4PPP/3R2K1 b - - 0 1",
+    "r1bq1rk1/pp2bppp/2n1pn2/2pp4/3P1B2/2PBPN2/PP1N1PPP/R2Q1RK1 w - - 0 9",
+    "8/5pk1/6p1/7p/3R3P/6P1/5PK1/3r4 b - - 0 1",
+]
+
+
+@pytest.mark.parametrize("fen", _PAWN_FENS)
+def test_pawn_structure_side_matches_reference(fen: str) -> None:
+    board = chess.Board(fen)
+    white_pawns = np.uint64(board.pawns & board.occupied_co[chess.WHITE])
+    black_pawns = np.uint64(board.pawns & board.occupied_co[chess.BLACK])
+    assert evaluate._pawn_structure_side(white_pawns, black_pawns, True) == (
+        evaluate._pawn_structure(board, chess.WHITE)
+    )
+    assert evaluate._pawn_structure_side(black_pawns, white_pawns, False) == (
+        evaluate._pawn_structure(board, chess.BLACK)
+    )
+
+
+@pytest.mark.parametrize("fen", _PAWN_FENS)
+def test_pawn_structure_jit_matches_reference(fen: str) -> None:
+    board = chess.Board(fen)
+    pieces, _occ, _turn = evaluate._encode(board)
+    combined = evaluate._pawn_structure(board, chess.WHITE) - evaluate._pawn_structure(
+        board, chess.BLACK
+    )
+    assert evaluate._pawn_structure_jit(pieces) == combined
+
+
+def test_pawn_structure_jit_is_colour_symmetric() -> None:
+    for fen in _PAWN_FENS:
+        board = chess.Board(fen)
+        pieces, _o, _t = evaluate._encode(board)
+        mpieces, _o2, _t2 = evaluate._encode(board.mirror())
+        assert evaluate._pawn_structure_jit(pieces) == -evaluate._pawn_structure_jit(mpieces)

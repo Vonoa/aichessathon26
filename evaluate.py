@@ -340,7 +340,7 @@ _PIECE_TYPES = (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN,
 # this block is the jitted port, built as one verifiable increment per commit:
 #   1  _encode + _ray_attacks + import-time warm-up                        [done]
 #   2  jitted material + tapered PST                                       [done]
-#   3  jitted pawn structure
+#   3  jitted pawn structure (doubled / isolated / passed)                 [done]
 #   4  jitted mobility + king safety (via _ray_attacks -- the speed win)
 #   5  evaluate() calls the jitted path; this file's old body becomes the
 #      _evaluate_reference used by tests/test_engine.py's golden values.
@@ -430,14 +430,16 @@ _PST_EG: npt.NDArray[np.int16] = np.array(
 
 
 @njit(cache=False)
-def _popcount(bb: np.uint64) -> int:
-    """SWAR population count -- all-uint64 so numba never sees a mixed-width shift."""
+def _popcount(bb: np.uint64) -> np.int64:
+    """SWAR population count. All-uint64 internally so numba never sees a mixed-width
+    shift; the result is cast to int64 so callers can do plain `x >> 3` / `2 * x`.
+    """
     bb = bb - ((bb >> np.uint64(1)) & np.uint64(0x5555555555555555))
     bb = (bb & np.uint64(0x3333333333333333)) + (
         (bb >> np.uint64(2)) & np.uint64(0x3333333333333333)
     )
     bb = (bb + (bb >> np.uint64(4))) & np.uint64(0x0F0F0F0F0F0F0F0F)
-    return int((bb * np.uint64(0x0101010101010101)) >> np.uint64(56))
+    return np.int64((bb * np.uint64(0x0101010101010101)) >> np.uint64(56))
 
 
 @njit(cache=False)
@@ -450,7 +452,7 @@ def _game_phase_jit(pieces: npt.NDArray[np.uint64]) -> int:
     rooks = _popcount(pieces[0, 3] | pieces[1, 3])
     queens = _popcount(pieces[0, 4] | pieces[1, 4])
     phase = knights + bishops + 2 * rooks + 4 * queens
-    return 24 if phase > 24 else phase
+    return int(24 if phase > 24 else phase)
 
 
 @njit(cache=False)
@@ -498,6 +500,94 @@ def _eval_material_pst_tapered(
     return int(blended / 24)
 
 
+# --- step 3: pawn structure ------------------------------------------------------
+#
+# Doubled / isolated by per-file pawn count (popcount of own & file mask); passed
+# by a front-span mask -- a pawn is passed iff no enemy pawn stands on its own or
+# an adjacent file, anywhere ahead of it. Masks baked here to match evaluate.
+# _pawn_structure()'s "for nf in (f-1, f, f+1): for er ahead of r" check exactly.
+_FILE_MASK_ARR: npt.NDArray[np.uint64] = np.array(
+    [0x0101010101010101 << f for f in range(8)], dtype=np.uint64
+)
+_PASSED_BONUS_ARR: npt.NDArray[np.int16] = np.array(
+    PASSED_PAWN_BONUS_BY_RANK, dtype=np.int16
+)
+
+
+def _build_passed_masks() -> tuple[npt.NDArray[np.uint64], npt.NDArray[np.uint64]]:
+    white: list[int] = []
+    black: list[int] = []
+    for sq in range(64):
+        file_, rank = sq & 7, sq >> 3
+        wm = 0
+        bm = 0
+        for nf in (file_ - 1, file_, file_ + 1):
+            if 0 <= nf <= 7:
+                for nr in range(8):
+                    target = 1 << (nr * 8 + nf)
+                    if nr > rank:
+                        wm |= target
+                    if nr < rank:
+                        bm |= target
+        white.append(wm)
+        black.append(bm)
+    return np.array(white, dtype=np.uint64), np.array(black, dtype=np.uint64)
+
+
+_PASSED_MASK_WHITE, _PASSED_MASK_BLACK = _build_passed_masks()
+
+
+@njit(cache=False)
+def _pawn_structure_side(own: np.uint64, enemy: np.uint64, is_white: bool) -> int:
+    """One side's pawn score (centipawns), mirroring evaluate._pawn_structure():
+    -12 per doubled pawn, -10 per isolated pawn, a by-rank bonus for each passed one.
+    """
+    score = 0
+
+    counts = np.empty(8, dtype=np.int64)
+    for f in range(8):
+        counts[f] = _popcount(own & _FILE_MASK_ARR[f])
+
+    for f in range(8):
+        c = int(counts[f])
+        if c > 1:
+            score += DOUBLED_PAWN_PENALTY * (c - 1)
+        if c > 0:
+            left = int(counts[f - 1]) if f > 0 else 0
+            right = int(counts[f + 1]) if f < 7 else 0
+            if left + right == 0:
+                score += ISOLATED_PAWN_PENALTY * c
+
+    bb = own
+    while bb != np.uint64(0):
+        lsb = bb & (~bb + np.uint64(1))
+        sq = _popcount(lsb - np.uint64(1))  # trailing zeros = square index
+        if is_white:
+            span = _PASSED_MASK_WHITE[sq]
+            rank = sq >> 3
+        else:
+            span = _PASSED_MASK_BLACK[sq]
+            rank = 7 - (sq >> 3)
+        if (enemy & span) == np.uint64(0):
+            score += int(_PASSED_BONUS_ARR[rank])
+        bb &= bb - np.uint64(1)
+
+    return score
+
+
+@njit(cache=False)
+def _pawn_structure_jit(pieces: npt.NDArray[np.uint64]) -> int:
+    """White pawn score minus Black's -- the sign*pawn_score combination evaluate()
+    folds into both mg and eg. Added to the tapered blend unchanged at step 5.
+    """
+    white_pawns = pieces[0, 0]
+    black_pawns = pieces[1, 0]
+    return int(
+        _pawn_structure_side(white_pawns, black_pawns, True)
+        - _pawn_structure_side(black_pawns, white_pawns, False)
+    )
+
+
 def _warm_up() -> None:
     """Compile the jitted kernels at import, with the exact dtypes the search feeds
     them, so numba never compiles on the clock (its `/tmp` cache is wiped per game).
@@ -509,6 +599,7 @@ def _warm_up() -> None:
     _popcount(np.uint64(0xFFFF00000000FFFF))
     _game_phase_jit(pieces)
     _eval_material_pst_tapered(pieces, _PIECE_VALUE_ARR, _PST_MG, _PST_EG)
+    _pawn_structure_jit(pieces)
 
 
 _warm_up()
