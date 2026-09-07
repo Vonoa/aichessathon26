@@ -224,13 +224,16 @@ def _mirror(square: int) -> int:
 
 
 def _game_phase(board: chess.Board) -> int:
-    phase = TOTAL_PHASE
+    """Non-pawn material still on the board: 24 at the start (pure midgame), 0 at bare
+    kings (pure endgame). evaluate() blends mg_score by phase and eg_score by 24 - phase.
+    """
+    phase = 0
     for piece_type, weight in PHASE_WEIGHTS.items():
-        phase -= weight * (
+        phase += weight * (
             len(board.pieces(piece_type, chess.WHITE))
             + len(board.pieces(piece_type, chess.BLACK))
         )
-    return max(0, min(TOTAL_PHASE, phase))
+    return min(TOTAL_PHASE, phase)
 
 
 def _pawn_structure(board: chess.Board, color: bool) -> int:
