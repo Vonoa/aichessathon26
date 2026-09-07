@@ -11,10 +11,11 @@ correct and produces sane scores before any tuning. texel_tune.py owns setting t
 numbers -- do not hand-adjust these from watching games. Register any new table you add
 here in texel_tune.py's get_tunable_tables() or it silently won't get tuned.
 
-NOT YET JITTED. This uses python-chess objects (piece_map(), pieces(), attacks_mask())
-for clarity while the weights are still being tuned -- tune this version first, since it's
-far easier to debug than numba, then port the tuned tables into Phase 3's jitted bitboard
-eval. Don't tune the jitted version directly.
+evaluate() runs the numba-jitted path (_evaluate_jit, built from the kernels in the
+"Jitted evaluation" section). _evaluate_reference() is the pure-python equivalent, kept
+verbatim as the oracle for tests/test_engine.py's golden values and the equivalence test
+in tests/test_evaljit.py. Tune against _evaluate_reference (easy to debug); the jitted
+kernels read the same PST_MG/PST_EG/PIECE_VALUES tables, so a retune flows through both.
 
 Returned score is from the side-to-move's point of view (negamax convention), matching
 search.py's expectations exactly as the current evaluate.py does.
@@ -336,16 +337,16 @@ _PIECE_TYPES = (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN,
 
 
 # ---------------------------------------------------------------------------
-# Jitted evaluation, step 1: board encoding + classical ray attacks + warm-up.
-#
-# The tapered eval above still runs the search (see evaluate()); this block is the
-# scaffold the jitted port is built on, one verifiable increment at a time:
-#   1 (here) _encode + _ray_attacks + import-time warm-up
-#   2        jitted material + tapered PST
-#   3        jitted pawn structure
-#   4        jitted mobility + king safety (via _ray_attacks -- the speed win)
-#   5        evaluate() calls the jitted path; this file's old body becomes the
-#            _evaluate_reference used by tests/test_engine.py's golden values.
+# Jitted evaluation. The tapered eval above still runs the search (see evaluate());
+# this block is the jitted port, built as one verifiable increment per commit:
+#   1  _encode + _ray_attacks + import-time warm-up                        [done]
+#   2  jitted material + tapered PST                                       [done]
+#   3  jitted pawn structure (doubled / isolated / passed)                 [done]
+#   4  jitted mobility + king safety (via _ray_attacks -- the speed win)   [done]
+#   5  evaluate() calls the jitted path (_evaluate_jit); the old body is    [done]
+#      _evaluate_reference, the oracle for the golden + equivalence tests.
+#   6  set-bit iteration in _material_pst; _encode fills reused buffers     [done]
+# Each kernel is pinned against the Python eval above by tests/test_evaljit.py.
 # ---------------------------------------------------------------------------
 
 # One uint64 per square, so the jitted code indexes a table instead of doing
@@ -393,44 +394,408 @@ def _ray_attacks(occ: np.uint64, sq: int, dirs: npt.NDArray[np.int64]) -> np.uin
 
 def _encode(
     board: chess.Board,
+    pieces: npt.NDArray[np.uint64] | None = None,
+    occ: npt.NDArray[np.uint64] | None = None,
 ) -> tuple[npt.NDArray[np.uint64], npt.NDArray[np.uint64], bool]:
-    """Board -> fixed arrays the jitted eval reads, built once per evaluate() call.
+    """Board -> fixed arrays the jitted eval reads.
 
     Returns:
       pieces: shape (2, 6) uint64 -- pieces[colour][piece_type - 1] bitboard,
               colour 0 = White, 1 = Black; piece_type is chess.PAWN..chess.KING.
       occ:    shape (3,) uint64 -- [white occupancy, black occupancy, all occupancy].
       turn:   True if White is to move (for the final side-to-move sign flip).
+
+    `pieces` and `occ`, if given, are filled in place -- the search passes two module
+    buffers so a leaf's eval allocates nothing. Omit them for a fresh pair (tests).
     """
-    pieces = np.empty((2, 6), dtype=np.uint64)
+    if pieces is None:
+        pieces = np.empty((2, 6), dtype=np.uint64)
+    if occ is None:
+        occ = np.empty(3, dtype=np.uint64)
     for pt in range(1, 7):
         pieces[0, pt - 1] = board.pieces_mask(pt, chess.WHITE)
         pieces[1, pt - 1] = board.pieces_mask(pt, chess.BLACK)
-    occ = np.array(
-        [board.occupied_co[chess.WHITE], board.occupied_co[chess.BLACK], board.occupied],
-        dtype=np.uint64,
-    )
+    occ[0] = board.occupied_co[chess.WHITE]
+    occ[1] = board.occupied_co[chess.BLACK]
+    occ[2] = board.occupied
     return pieces, occ, board.turn
 
 
+# --- step 2: material + tapered PST -----------------------------------------
+#
+# The Python tables above, baked into fixed arrays the jitted kernels read. Rows
+# follow _PIECE_TYPES order: 0 = pawn ... 5 = king, matching _encode()'s pieces[c].
+# PST_MG / PST_EG are already _flip_ranks'd (a1 = 0), so the jit indexes `sq`
+# directly for White and `sq ^ 56` for Black -- no second flip.
+_PIECE_VALUE_ARR: npt.NDArray[np.int16] = np.array(
+    [PIECE_VALUES[pt] for pt in _PIECE_TYPES], dtype=np.int16
+)
+_PST_MG: npt.NDArray[np.int16] = np.array(
+    [PST_MG[pt] for pt in _PIECE_TYPES], dtype=np.int16
+)
+_PST_EG: npt.NDArray[np.int16] = np.array(
+    [PST_EG[pt] for pt in _PIECE_TYPES], dtype=np.int16
+)
+
+
+@njit(cache=False)
+def _popcount(bb: np.uint64) -> np.int64:
+    """SWAR population count. All-uint64 internally so numba never sees a mixed-width
+    shift; the result is cast to int64 so callers can do plain `x >> 3` / `2 * x`.
+    """
+    bb = bb - ((bb >> np.uint64(1)) & np.uint64(0x5555555555555555))
+    bb = (bb & np.uint64(0x3333333333333333)) + (
+        (bb >> np.uint64(2)) & np.uint64(0x3333333333333333)
+    )
+    bb = (bb + (bb >> np.uint64(4))) & np.uint64(0x0F0F0F0F0F0F0F0F)
+    return np.int64((bb * np.uint64(0x0101010101010101)) >> np.uint64(56))
+
+
+@njit(cache=False)
+def _game_phase_jit(pieces: npt.NDArray[np.uint64]) -> int:
+    """Non-pawn material on the board: 24 at the start (midgame), 0 at bare kings.
+    Mirrors evaluate._game_phase -- N/B weight 1, R weight 2, Q weight 4, capped at 24.
+    """
+    knights = _popcount(pieces[0, 1] | pieces[1, 1])
+    bishops = _popcount(pieces[0, 2] | pieces[1, 2])
+    rooks = _popcount(pieces[0, 3] | pieces[1, 3])
+    queens = _popcount(pieces[0, 4] | pieces[1, 4])
+    phase = knights + bishops + 2 * rooks + 4 * queens
+    return int(24 if phase > 24 else phase)
+
+
+@njit(cache=False)
+def _material_pst(
+    pieces: npt.NDArray[np.uint64],
+    values: npt.NDArray[np.int16],
+    pst_mg: npt.NDArray[np.int16],
+    pst_eg: npt.NDArray[np.int16],
+) -> tuple[int, int]:
+    """(mg, eg) material + piece-square sums, White-positive. Black squares are
+    mirrored (sq ^ 56) and subtracted, exactly as evaluate()'s piece loop does.
+
+    Iterates set bits (a board has ~16-32 pieces) rather than scanning all 64 squares.
+    """
+    mg = 0
+    eg = 0
+    for pt in range(6):
+        v = int(values[pt])
+
+        bb = pieces[0, pt]
+        while bb != np.uint64(0):
+            lsb = bb & (~bb + np.uint64(1))
+            sq = int(_popcount(lsb - np.uint64(1)))
+            mg += v + int(pst_mg[pt, sq])
+            eg += v + int(pst_eg[pt, sq])
+            bb &= bb - np.uint64(1)
+
+        bb = pieces[1, pt]
+        while bb != np.uint64(0):
+            lsb = bb & (~bb + np.uint64(1))
+            idx = int(_popcount(lsb - np.uint64(1))) ^ 56
+            mg -= v + int(pst_mg[pt, idx])
+            eg -= v + int(pst_eg[pt, idx])
+            bb &= bb - np.uint64(1)
+    return mg, eg
+
+
+@njit(cache=False)
+def _eval_material_pst_tapered(
+    pieces: npt.NDArray[np.uint64],
+    values: npt.NDArray[np.int16],
+    pst_mg: npt.NDArray[np.int16],
+    pst_eg: npt.NDArray[np.int16],
+) -> int:
+    """Step-2 entry point: material + tapered PST only, White-positive (no side-to-move
+    flip yet). Grows into the full jitted eval as steps 3-4 land. Blend matches
+    evaluate() -- int(.../24) truncation toward zero keeps the score colour-symmetric.
+    """
+    phase = _game_phase_jit(pieces)
+    mg, eg = _material_pst(pieces, values, pst_mg, pst_eg)
+    blended = mg * phase + eg * (24 - phase)
+    return int(blended / 24)
+
+
+# --- step 3: pawn structure ------------------------------------------------------
+#
+# Doubled / isolated by per-file pawn count (popcount of own & file mask); passed
+# by a front-span mask -- a pawn is passed iff no enemy pawn stands on its own or
+# an adjacent file, anywhere ahead of it. Masks baked here to match evaluate.
+# _pawn_structure()'s "for nf in (f-1, f, f+1): for er ahead of r" check exactly.
+_FILE_MASK_ARR: npt.NDArray[np.uint64] = np.array(
+    [0x0101010101010101 << f for f in range(8)], dtype=np.uint64
+)
+_PASSED_BONUS_ARR: npt.NDArray[np.int16] = np.array(
+    PASSED_PAWN_BONUS_BY_RANK, dtype=np.int16
+)
+
+
+def _build_passed_masks() -> tuple[npt.NDArray[np.uint64], npt.NDArray[np.uint64]]:
+    white: list[int] = []
+    black: list[int] = []
+    for sq in range(64):
+        file_, rank = sq & 7, sq >> 3
+        wm = 0
+        bm = 0
+        for nf in (file_ - 1, file_, file_ + 1):
+            if 0 <= nf <= 7:
+                for nr in range(8):
+                    target = 1 << (nr * 8 + nf)
+                    if nr > rank:
+                        wm |= target
+                    if nr < rank:
+                        bm |= target
+        white.append(wm)
+        black.append(bm)
+    return np.array(white, dtype=np.uint64), np.array(black, dtype=np.uint64)
+
+
+_PASSED_MASK_WHITE, _PASSED_MASK_BLACK = _build_passed_masks()
+
+
+@njit(cache=False)
+def _pawn_structure_side(own: np.uint64, enemy: np.uint64, is_white: bool) -> int:
+    """One side's pawn score (centipawns), mirroring evaluate._pawn_structure():
+    -12 per doubled pawn, -10 per isolated pawn, a by-rank bonus for each passed one.
+    """
+    score = 0
+
+    counts = np.empty(8, dtype=np.int64)
+    for f in range(8):
+        counts[f] = _popcount(own & _FILE_MASK_ARR[f])
+
+    for f in range(8):
+        c = int(counts[f])
+        if c > 1:
+            score += DOUBLED_PAWN_PENALTY * (c - 1)
+        if c > 0:
+            left = int(counts[f - 1]) if f > 0 else 0
+            right = int(counts[f + 1]) if f < 7 else 0
+            if left + right == 0:
+                score += ISOLATED_PAWN_PENALTY * c
+
+    bb = own
+    while bb != np.uint64(0):
+        lsb = bb & (~bb + np.uint64(1))
+        sq = _popcount(lsb - np.uint64(1))  # trailing zeros = square index
+        if is_white:
+            span = _PASSED_MASK_WHITE[sq]
+            rank = sq >> 3
+        else:
+            span = _PASSED_MASK_BLACK[sq]
+            rank = 7 - (sq >> 3)
+        if (enemy & span) == np.uint64(0):
+            score += int(_PASSED_BONUS_ARR[rank])
+        bb &= bb - np.uint64(1)
+
+    return score
+
+
+@njit(cache=False)
+def _pawn_structure_jit(pieces: npt.NDArray[np.uint64]) -> int:
+    """White pawn score minus Black's -- the sign*pawn_score combination evaluate()
+    folds into both mg and eg. Added to the tapered blend unchanged at step 5.
+    """
+    white_pawns = pieces[0, 0]
+    black_pawns = pieces[1, 0]
+    return int(
+        _pawn_structure_side(white_pawns, black_pawns, True)
+        - _pawn_structure_side(black_pawns, white_pawns, False)
+    )
+
+
+# --- step 4: mobility + king safety --------------------------------------------
+#
+# The speed win: evaluate()'s _mobility and _king_safety_mg call board.attacks_mask()
+# ~24x per leaf (python-chess slider rays); here it is a jitted _ray_attacks loop.
+# Weights indexed by piece type 0=pawn..5=king (0 where the term does not apply).
+_MOBILITY_MG_ARR: npt.NDArray[np.int16] = np.array(
+    [0, MOBILITY_MG[chess.KNIGHT], MOBILITY_MG[chess.BISHOP],
+     MOBILITY_MG[chess.ROOK], MOBILITY_MG[chess.QUEEN], 0], dtype=np.int16,
+)
+_MOBILITY_EG_ARR: npt.NDArray[np.int16] = np.array(
+    [0, MOBILITY_EG[chess.KNIGHT], MOBILITY_EG[chess.BISHOP],
+     MOBILITY_EG[chess.ROOK], MOBILITY_EG[chess.QUEEN], 0], dtype=np.int16,
+)
+_ATTACKER_WEIGHT_ARR: npt.NDArray[np.int16] = np.array(
+    [ATTACKER_ZONE_WEIGHT[chess.PAWN], ATTACKER_ZONE_WEIGHT[chess.KNIGHT],
+     ATTACKER_ZONE_WEIGHT[chess.BISHOP], ATTACKER_ZONE_WEIGHT[chess.ROOK],
+     ATTACKER_ZONE_WEIGHT[chess.QUEEN], 0], dtype=np.int16,
+)
+_KING_ZONE_ARR: npt.NDArray[np.uint64] = np.array(_KING_ZONE, dtype=np.uint64)
+# Shield / pawn-attack tables in this file's colour order: index 0 = White, 1 = Black.
+_SHIELD_ARR: npt.NDArray[np.uint64] = np.array(
+    [_WHITE_SHIELD, _BLACK_SHIELD], dtype=np.uint64
+)
+_PAWN_ATTACKS_ARR: npt.NDArray[np.uint64] = np.array(
+    [list(chess.BB_PAWN_ATTACKS[chess.WHITE]), list(chess.BB_PAWN_ATTACKS[chess.BLACK])],
+    dtype=np.uint64,
+)
+
+
+@njit(cache=False)
+def _piece_attacks(occ_all: np.uint64, sq: int, pt: int) -> np.uint64:
+    """attacks_mask for a non-pawn piece type: 1=knight, 2=bishop, 3=rook, 4=queen."""
+    if pt == 1:
+        return np.uint64(_KNIGHT_ATTACKS[sq])
+    if pt == 2:
+        return _ray_attacks(occ_all, sq, _BISHOP_DIRS)
+    if pt == 3:
+        return _ray_attacks(occ_all, sq, _ROOK_DIRS)
+    return _ray_attacks(occ_all, sq, _QUEEN_DIRS)
+
+
+@njit(cache=False)
+def _mobility_side(
+    pieces: npt.NDArray[np.uint64], occ_all: np.uint64, colour: int
+) -> tuple[int, int]:
+    """(mg, eg) mobility for one side: attack-square count per N/B/R/Q times its weight,
+    mirroring evaluate._mobility (which counts every attacked square, own pieces included).
+    """
+    mg = 0
+    eg = 0
+    for pt in range(1, 5):  # KNIGHT, BISHOP, ROOK, QUEEN
+        wmg = int(_MOBILITY_MG_ARR[pt])
+        weg = int(_MOBILITY_EG_ARR[pt])
+        bb = pieces[colour, pt]
+        while bb != np.uint64(0):
+            lsb = bb & (~bb + np.uint64(1))
+            sq = int(_popcount(lsb - np.uint64(1)))
+            att = _piece_attacks(occ_all, sq, pt)
+            n = int(_popcount(att))
+            mg += wmg * n
+            eg += weg * n
+            bb &= bb - np.uint64(1)
+    return mg, eg
+
+
+@njit(cache=False)
+def _mobility_jit(
+    pieces: npt.NDArray[np.uint64], occ: npt.NDArray[np.uint64]
+) -> tuple[int, int]:
+    """(mg, eg) = White mobility minus Black's -- the sign*mob combination evaluate() folds
+    into mg_score and eg_score respectively."""
+    all_occ = occ[2]
+    white_mg, white_eg = _mobility_side(pieces, all_occ, 0)
+    black_mg, black_eg = _mobility_side(pieces, all_occ, 1)
+    return int(white_mg - black_mg), int(white_eg - black_eg)
+
+
+@njit(cache=False)
+def _king_safety_side(
+    pieces: npt.NDArray[np.uint64], occ_all: np.uint64, king_sq: int, colour: int
+) -> int:
+    """MG-scale king safety for one side, mirroring evaluate._king_safety_mg: pawn shield,
+    open / semi-open files beside the king, and enemy attacker-zone pressure. The caller
+    fades this by game phase.
+    """
+    own_pawns = pieces[colour, 0]
+    enemy = 1 - colour
+    enemy_pawns = pieces[enemy, 0]
+    score = 0
+
+    shield = _SHIELD_ARR[colour, king_sq]
+    score += SHIELD_PAWN_BONUS * int(_popcount(own_pawns & shield))
+
+    king_file = king_sq % 8
+    for nf in range(king_file - 1, king_file + 2):
+        if nf < 0 or nf > 7:
+            continue
+        file_mask = _FILE_MASK_ARR[nf]
+        has_own = (own_pawns & file_mask) != np.uint64(0)
+        has_enemy = (enemy_pawns & file_mask) != np.uint64(0)
+        if not has_own and not has_enemy:
+            score += OPEN_FILE_PENALTY
+        elif not has_own and has_enemy:
+            score += SEMI_OPEN_FILE_PENALTY
+
+    zone = _KING_ZONE_ARR[king_sq]
+    for pt in range(5):  # PAWN, KNIGHT, BISHOP, ROOK, QUEEN
+        weight = int(_ATTACKER_WEIGHT_ARR[pt])
+        bb = pieces[enemy, pt]
+        while bb != np.uint64(0):
+            lsb = bb & (~bb + np.uint64(1))
+            sq = int(_popcount(lsb - np.uint64(1)))
+            # both branches are uint64, so the ternary is numba-safe here (unlike a
+            # ternary that mixes an int with a promoted-to-float shift result)
+            att = _PAWN_ATTACKS_ARR[enemy, sq] if pt == 0 else _piece_attacks(occ_all, sq, pt)
+            if (att & zone) != np.uint64(0):
+                score -= weight
+            bb &= bb - np.uint64(1)
+
+    return int(score)
+
+
+@njit(cache=False)
+def _king_safety_jit(
+    pieces: npt.NDArray[np.uint64],
+    occ: npt.NDArray[np.uint64],
+    white_king: int,
+    black_king: int,
+) -> int:
+    """White king safety minus Black's (MG-scale, unfaded). evaluate() adds this to
+    mg_score only, then the phase blend fades it toward 0 in the endgame."""
+    all_occ = occ[2]
+    return int(
+        _king_safety_side(pieces, all_occ, white_king, 0)
+        - _king_safety_side(pieces, all_occ, black_king, 1)
+    )
+
+
+@njit(cache=False)
+def _evaluate_jit(
+    pieces: npt.NDArray[np.uint64],
+    occ: npt.NDArray[np.uint64],
+    white_king: int,
+    black_king: int,
+    white_to_move: bool,
+) -> int:
+    """Full tapered eval, side-to-move relative -- the jitted equivalent of
+    _evaluate_reference()'s body (minus the stalemate / insufficient-material guard,
+    which the Python wrapper still does). Assembly matches the reference exactly:
+    king safety enters mg only; pawn structure enters both mg and eg.
+    """
+    phase = _game_phase_jit(pieces)
+    material_mg, material_eg = _material_pst(pieces, _PIECE_VALUE_ARR, _PST_MG, _PST_EG)
+    pawn = _pawn_structure_jit(pieces)
+    mob_mg, mob_eg = _mobility_jit(pieces, occ)
+    king_safety = _king_safety_jit(pieces, occ, white_king, black_king)
+
+    mg_total = material_mg + pawn + mob_mg + king_safety
+    eg_total = material_eg + pawn + mob_eg
+    blended = mg_total * phase + eg_total * (24 - phase)
+    tapered = int(blended / 24)
+    if white_to_move:
+        return tapered
+    return -tapered
+
+
 def _warm_up() -> None:
-    """Compile the jitted primitives at import, with the exact dtypes the search feeds
+    """Compile the jitted kernels at import, with the exact dtypes the search feeds
     them, so numba never compiles on the clock (its `/tmp` cache is wiped per game).
     """
-    occ = np.uint64(0x00FF00000000FF00)
+    occ_scalar = np.uint64(0x00FF00000000FF00)
     for dirs in (_BISHOP_DIRS, _ROOK_DIRS, _QUEEN_DIRS):
-        _ray_attacks(occ, 27, dirs)
+        _ray_attacks(occ_scalar, 27, dirs)
+    pieces, occ, _turn = _encode(chess.Board())
+    _popcount(np.uint64(0xFFFF00000000FFFF))
+    _game_phase_jit(pieces)
+    _eval_material_pst_tapered(pieces, _PIECE_VALUE_ARR, _PST_MG, _PST_EG)
+    _pawn_structure_jit(pieces)
+    _mobility_jit(pieces, occ)
+    _king_safety_jit(pieces, occ, 4, 60)  # e1 / e8 kings of the start position
+    _evaluate_jit(pieces, occ, 4, 60, True)
 
 
 _warm_up()
 
 
-def evaluate(board: chess.Board) -> int:
-    """Tapered eval, centipawns, from side-to-move's perspective (negamax convention).
+def _evaluate_reference(board: chess.Board) -> int:
+    """Pure-python tapered eval -- the oracle evaluate() (the jitted path) is checked
+    against. Kept verbatim; tune weights here, and register new tables in texel_tune.py.
 
-    The search never calls this on a checkmate (it returns a mate score for a node with no
-    legal moves), so there is no is_checkmate() guard here - it would be a wasted movegen
-    at every leaf.
+    Tapered eval, centipawns, from side-to-move's perspective (negamax convention). The
+    search never calls this on a checkmate, so there is no is_checkmate() guard here.
     """
     if board.is_stalemate() or board.is_insufficient_material():
         return 0
@@ -477,3 +842,29 @@ def evaluate(board: chess.Board) -> int:
     tapered = int(blended / TOTAL_PHASE)
 
     return tapered if board.turn == chess.WHITE else -tapered
+
+
+# Reused every evaluate() call so a leaf's eval allocates nothing. Safe because the
+# search is single-threaded and _evaluate_jit reads them before evaluate() returns.
+_EVAL_PIECES: npt.NDArray[np.uint64] = np.empty((2, 6), dtype=np.uint64)
+_EVAL_OCC: npt.NDArray[np.uint64] = np.empty(3, dtype=np.uint64)
+
+
+def evaluate(board: chess.Board) -> int:
+    """Tapered eval, centipawns, from the side-to-move's point of view (negamax
+    convention). Runs the numba-jitted path; _evaluate_reference() is the pure-python
+    equivalent, kept as the golden-test oracle.
+
+    The search never calls this on a checkmate (a node with no legal moves returns a mate
+    score), so there is no is_checkmate() guard -- it would be a wasted movegen per leaf.
+    """
+    if board.is_stalemate() or board.is_insufficient_material():
+        return 0
+
+    white_king = board.king(chess.WHITE)
+    black_king = board.king(chess.BLACK)
+    if white_king is None or black_king is None:
+        return _evaluate_reference(board)  # not a legal search position; stay safe
+
+    pieces, occ, white_to_move = _encode(board, _EVAL_PIECES, _EVAL_OCC)
+    return int(_evaluate_jit(pieces, occ, white_king, black_king, white_to_move))
