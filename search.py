@@ -88,11 +88,15 @@ def search_move(
     _killers[:] = [None] * _KILLER_SLOTS
     _hist[:] = [0] * 4096
 
+    # Capture the move label now: an interrupted search unwinds through _Timeout without
+    # popping, so board.fullmove_number / board.turn are unreliable once the loop ends.
+    label = f"{board.fullmove_number}{'w' if board.turn else 'b'}"
+
     legal = list(board.legal_moves)
     if not legal:
         return "0000"
     if len(legal) == 1:
-        _log_move(board, legal[0], 0, 0, time_left_ms, time.monotonic())
+        _log_move(label, legal[0], 0, 0, time_left_ms, time.monotonic())
         return legal[0].uci()
 
     started = time.monotonic()
@@ -113,20 +117,19 @@ def search_move(
             break  # forced mate found; a deeper search cannot improve on it
         if time.monotonic() >= deadline:
             break
-    _log_move(board, best, score, _last_depth, time_left_ms, started)
+    _log_move(label, best, score, _last_depth, time_left_ms, started)
     return best.uci()
 
 
 def _log_move(
-    board: chess.Board, move: chess.Move, score: int, depth: int, clock_ms: int, started: float
+    label: str, move: chess.Move, score: int, depth: int, clock_ms: int, started: float
 ) -> None:
     """One compact line per move to stderr, kept in the platform's per-game log so a rated
     game can be diagnosed after the fact (real depth reached, nodes, time actually spent).
     """
     ms = (time.monotonic() - started) * 1000.0
-    tag = f"{board.fullmove_number}{'w' if board.turn else 'b'}"
     print(
-        f"[{tag}] {move.uci()} d{depth} score {score:+d} nodes {_nodes} "
+        f"[{label}] {move.uci()} d{depth} score {score:+d} nodes {_nodes} "
         f"{ms:.0f}ms clock {clock_ms}",
         flush=True,
     )
