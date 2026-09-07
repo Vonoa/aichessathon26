@@ -239,3 +239,19 @@ definitions live in [docs/PLAN.md](docs/PLAN.md).
 - Golden `"8/2k5/8/8/8/8/5K2/6R1 w"` moved 540 -> 578 (deliberate; only the bare-king
   case changes). Colour symmetry preserved.
 - Gate + arena vs `versions/phase5jit` pending.
+
+### 2026-09-07 — Non-linear king safety (branch `king-safety-nonlinear`)
+
+- The attacker-zone term in `_king_safety_mg` / `_king_safety_side` was linear (`-weight`
+  per enemy piece touching the king's 3x3 zone). Real king danger is roughly quadratic in
+  the number of attackers -- one piece is nothing, three is often decisive. Rated 56 was
+  lost to a Greek-gift sac the eval never flagged (up ~3 pieces of material, eval said
+  -33; a proper king-safety term scores that near -400).
+- New: sum `unit * (zone squares the piece attacks)` over every attacker, count the
+  attackers, then `1 -> -danger`, `2+ -> -min(450, danger^2 * 65 // 100)`. Units
+  P2 N3 B3 R5 Q7. All first-guess constants -- arena calibrates. `ATTACKER_ZONE_WEIGHT`
+  removed, replaced by `KING_ATTACK_UNIT` + `KING_DANGER_SCALE` + `KING_DANGER_MAX`.
+- Reference and jit changed identically; equivalence test holds. Several middlegame golden
+  values re-captured (a deliberate eval rework); the symmetric golden stays 0, the
+  phase-faded endgame goldens are unchanged.
+- Gate + arena vs `versions/phase5jit` pending.
