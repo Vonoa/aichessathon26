@@ -18,7 +18,8 @@ Phase 5f adds contempt: every draw path scores _CONTEMPT below equal from the ro
 point of view, so the engine only accepts a draw when it genuinely believes it is worse.
 
 Check extension: a node that is in check is searched one ply deeper, so a forcing line
-resolves before it is evaluated.
+resolves before it is evaluated. Late-move reductions: quiet moves ordered late are
+searched shallower first and only re-searched at full depth if they beat alpha.
 
 The engine is deterministic by construction: no RNG is imported, move ordering is a
 stable sort over python-chess's fixed generation order, and ties are broken by first-seen.
@@ -43,6 +44,8 @@ _QS_MAX_PLY = _MAX_DEPTH + 32  # hard cap on quiescence recursion, a safety net
 
 _EXACT, _LOWER, _UPPER = 0, 1, 2  # transposition-table bound kinds
 _TT_MAX = 1_000_000  # entries; clear rather than grow past this
+_LMR_MIN_DEPTH = 3  # only reduce late moves with this much depth left
+_LMR_MIN_MOVE = 3  # first this many moves at each node are searched at full depth
 
 # Move-ordering score bands: captures and promotions on top, then the two killer slots
 # for this ply, then quiet moves ranked by the history heuristic (well below these).
@@ -195,16 +198,34 @@ def _negamax(
     alpha_orig = alpha
     value = -MATE - 1
     best_move: chess.Move | None = None
-    for move in ordered:
+    for move_index, move in enumerate(ordered):
+        quiet = move.promotion is None and not board.is_capture(move)
         board.push(move)
-        score = -_negamax(board, depth - 1, ply + 1, -beta, -alpha, deadline)
+
+        # Late-move reduction: quiet moves ordered late are probably bad, so search them
+        # shallower first; if one beats alpha anyway, re-search it at full depth.
+        reduce = (
+            quiet
+            and not in_check
+            and depth >= _LMR_MIN_DEPTH
+            and move_index >= _LMR_MIN_MOVE
+            and not board.is_check()
+        )
+        if reduce:
+            r = 2 if move_index >= _LMR_MIN_MOVE + 3 else 1
+            score = -_negamax(board, depth - 1 - r, ply + 1, -beta, -alpha, deadline)
+            if score > alpha:
+                score = -_negamax(board, depth - 1, ply + 1, -beta, -alpha, deadline)
+        else:
+            score = -_negamax(board, depth - 1, ply + 1, -beta, -alpha, deadline)
+
         board.pop()
         if score > value:
             value = score
             best_move = move
         alpha = max(alpha, value)
         if alpha >= beta:
-            if not board.is_capture(move) and move.promotion is None:
+            if quiet:
                 _record_cutoff(move, ply, depth)
             break
 
