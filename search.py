@@ -14,6 +14,9 @@ Phase 4b adds killer moves and a history heuristic: a quiet move that caused a b
 cutoff is tried early in sibling nodes (killer, per ply) and its from/to square pair
 accrues a score that ranks the remaining quiet moves. Both reset each move.
 
+Phase 5f adds contempt: every draw path scores _CONTEMPT below equal from the root side's
+point of view, so the engine only accepts a draw when it genuinely believes it is worse.
+
 The engine is deterministic by construction: no RNG is imported, move ordering is a
 stable sort over python-chess's fixed generation order, and ties are broken by first-seen.
 The same position and clock always produce the same move.
@@ -29,6 +32,7 @@ from evaluate import evaluate
 
 MATE = 1_000_000
 _MATE_THRESHOLD = MATE - 1_000  # a score past this is a forced mate
+_CONTEMPT = 25  # a draw scores this many centipawns below equal, so the engine plays to win
 _RESERVE_MS = 500  # keep at least this on the clock; the watchdog does not forgive
 _CHECK_INTERVAL = 255  # test the wall clock once per this many nodes
 _MAX_DEPTH = 64
@@ -145,20 +149,20 @@ def _negamax(
 ) -> int:
     _tick(deadline)
     if board.is_fifty_moves():
-        return 0
+        return _draw_score(ply)
     if chess.popcount(board.occupied) <= 4 and board.is_insufficient_material():
-        return 0
+        return _draw_score(ply)
 
     moves = list(board.legal_moves)
     if not moves:
-        return -MATE + ply if board.is_check() else 0
+        return -MATE + ply if board.is_check() else _draw_score(ply)
 
     # A repetition or an already-seen position is a draw even when it lands exactly on the
     # horizon, so this must run before the depth<=0 leaf return. The key is only computed
     # once halfmove_clock makes a repetition possible, so quiet leaves still skip it.
     key = board._transposition_key() if board.halfmove_clock >= 4 else None
     if key is not None and (board.is_repetition(2) or key in _seen):
-        return 0
+        return _draw_score(ply)
     if depth <= 0:
         return _qsearch(board, ply, alpha, beta, deadline)
 
@@ -289,6 +293,15 @@ def _record_cutoff(move: chess.Move, ply: int, depth: int) -> None:
         _killers[base + 1] = _killers[base]
         _killers[base] = move
     _hist[move.from_square * 64 + move.to_square] += depth * depth
+
+
+def _draw_score(ply: int) -> int:
+    """Contempt: a draw is worth _CONTEMPT below equal from the root side's point of view.
+    ply is even on the root side's turn, odd on the opponent's; the sign flips so the value
+    stays consistent through negamax's per-ply negation (and per-position, since a position
+    always recurs at the same ply parity).
+    """
+    return -_CONTEMPT if ply % 2 == 0 else _CONTEMPT
 
 
 def _tick(deadline: float) -> None:

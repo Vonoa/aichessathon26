@@ -66,15 +66,17 @@ def test_is_deterministic() -> None:
 
 
 def test_seen_position_is_a_draw_at_the_horizon() -> None:
-    # Regression (Phase 3b): a position already seen in the game must score 0 even at
-    # depth 0, not be evaluated by material.
+    # Regression (Phase 3b): a position already seen in the game must score as a draw even
+    # at depth 0, not be evaluated by material. With contempt (5f) a draw is not exactly 0.
     board = chess.Board("8/8/8/4k3/8/8/3RK3/8 w - - 10 40")  # white is up a whole rook
     search._seen = frozenset({board._transposition_key()})
     try:
-        at_horizon = search._negamax(board, 0, 1, -search.MATE, search.MATE, time.monotonic() + 5)
+        even = search._negamax(board, 0, 0, -search.MATE, search.MATE, time.monotonic() + 5)
+        odd = search._negamax(board, 0, 1, -search.MATE, search.MATE, time.monotonic() + 5)
     finally:
         search._seen = frozenset()
-    assert at_horizon == 0
+    assert even == -search._CONTEMPT
+    assert odd == search._CONTEMPT
 
 
 def test_qsearch_resolves_a_hanging_piece() -> None:
