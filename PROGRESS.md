@@ -225,3 +225,17 @@ definitions live in [docs/PLAN.md](docs/PLAN.md).
   mypy `ignore_missing_imports` override).
 - PROGRESS.md gap noted in `audit.md` (no entries for Phase 5 eval / contempt / check-ext /
   LMR / harness merge) is still open -- backfill on a separate pass.
+
+### 2026-09-07 — KX-vs-K mate driver (branch `kx-mate-driver`)
+
+- `_mopup(board)` / jitted `_mopup_jit`: white-relative, 0 unless exactly one side is a
+  bare king. Adds, for the winning side, `10 * centre-manhattan-distance(lone king)` +
+  `4 * (7 - Chebyshev(kings))` -- push the lone king to a corner, march the winning king
+  up. Added after the tapered blend, before the side-to-move flip, in both
+  `_evaluate_reference` and `_evaluate_jit`; the equivalence test pins them equal.
+- Targets the recurring fifty-move / threefold draws vs `phase5eval`/`phase5jit`: the eval
+  was flat in KQ/KR-vs-K (no signal to close the net), so the search shuffled to the
+  50-move rule. Small vs the material lead -- a gradient to convert by.
+- Golden `"8/2k5/8/8/8/8/5K2/6R1 w"` moved 540 -> 578 (deliberate; only the bare-king
+  case changes). Colour symmetry preserved.
+- Gate + arena vs `versions/phase5jit` pending.

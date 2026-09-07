@@ -201,6 +201,12 @@ PASSED_PAWN_BONUS_BY_RANK = [0, 5, 10, 20, 35, 60, 100, 0]  # index = rank from 
 MOBILITY_MG = {chess.KNIGHT: 4, chess.BISHOP: 4, chess.ROOK: 2, chess.QUEEN: 1}
 MOBILITY_EG = {chess.KNIGHT: 4, chess.BISHOP: 5, chess.ROOK: 3, chess.QUEEN: 2}
 
+# KX-vs-K mate driver (centipawns). Only active when one side is a bare king: push the
+# lone king off the centre toward a corner, and march the winning king up to support the
+# mate. Small vs the material lead -- a gradient to convert by, not a material term.
+MOPUP_CENTER_WEIGHT = 10  # per unit of the lone king's centre-manhattan distance (0..6)
+MOPUP_KINGS_WEIGHT = 4  # per unit the winning king is closer than 7 (Chebyshev)
+
 # King safety (centipawns, MG-scale -- faded by phase before being added, see evaluate()).
 SHIELD_PAWN_BONUS = 12
 OPEN_FILE_PENALTY = -22
@@ -234,6 +240,37 @@ for _sq in range(64):
 
 def _mirror(square: int) -> int:
     return square ^ 56
+
+
+def _center_manhattan_distance(square: int) -> int:
+    """0 on the four centre squares, 6 in a corner -- how far a square is from the middle.
+    Used to push a lone king toward the edge, where it can be mated."""
+    f, r = square & 7, square >> 3
+    file_d = f - 4 if f > 3 else 3 - f
+    rank_d = r - 4 if r > 3 else 3 - r
+    return file_d + rank_d
+
+
+def _mopup(board: chess.Board) -> int:
+    """White-relative KX-vs-K driver, 0 unless exactly one side is a bare king. Rewards the
+    winning side for cornering the lone king and closing the distance between the kings.
+    """
+    white = board.occupied_co[chess.WHITE]
+    black = board.occupied_co[chess.BLACK]
+    white_bare = white == board.kings & white
+    black_bare = black == board.kings & black
+    if white_bare == black_bare:  # both bare (KvK) or neither -- no driver
+        return 0
+
+    loser = chess.WHITE if white_bare else chess.BLACK
+    lone_king = board.king(loser)
+    winning_king = board.king(not loser)
+    if lone_king is None or winning_king is None:
+        return 0
+
+    score = MOPUP_CENTER_WEIGHT * _center_manhattan_distance(lone_king)
+    score += MOPUP_KINGS_WEIGHT * (7 - chess.square_distance(winning_king, lone_king))
+    return -score if loser == chess.WHITE else score
 
 
 def _game_phase(board: chess.Board) -> int:
@@ -743,6 +780,48 @@ def _king_safety_jit(
 
 
 @njit(cache=False)
+def _center_manhattan_distance_jit(square: int) -> int:
+    f = square & 7
+    r = square >> 3
+    file_d = f - 4 if f > 3 else 3 - f
+    rank_d = r - 4 if r > 3 else 3 - r
+    return file_d + rank_d
+
+
+@njit(cache=False)
+def _mopup_jit(
+    occ: npt.NDArray[np.uint64],
+    pieces: npt.NDArray[np.uint64],
+    white_king: int,
+    black_king: int,
+) -> int:
+    """White-relative KX-vs-K driver, 0 unless exactly one side is a bare king. Mirrors
+    evaluate._mopup: corner the lone king, close the distance between the kings."""
+    white_bare = occ[0] == pieces[0, 5]
+    black_bare = occ[1] == pieces[1, 5]
+    if white_bare == black_bare:
+        return 0
+
+    if white_bare:
+        lone_king = white_king
+        winning_king = black_king
+        sign = -1
+    else:
+        lone_king = black_king
+        winning_king = white_king
+        sign = 1
+
+    lf = lone_king & 7
+    lr = lone_king >> 3
+    wf = winning_king & 7
+    wr = winning_king >> 3
+    kings_dist = max(abs(wf - lf), abs(wr - lr))
+    score = MOPUP_CENTER_WEIGHT * _center_manhattan_distance_jit(lone_king)
+    score += MOPUP_KINGS_WEIGHT * (7 - kings_dist)
+    return sign * score
+
+
+@njit(cache=False)
 def _evaluate_jit(
     pieces: npt.NDArray[np.uint64],
     occ: npt.NDArray[np.uint64],
@@ -764,7 +843,7 @@ def _evaluate_jit(
     mg_total = material_mg + pawn + mob_mg + king_safety
     eg_total = material_eg + pawn + mob_eg
     blended = mg_total * phase + eg_total * (24 - phase)
-    tapered = int(blended / 24)
+    tapered = int(blended / 24) + _mopup_jit(occ, pieces, white_king, black_king)
     if white_to_move:
         return tapered
     return -tapered
@@ -784,6 +863,7 @@ def _warm_up() -> None:
     _pawn_structure_jit(pieces)
     _mobility_jit(pieces, occ)
     _king_safety_jit(pieces, occ, 4, 60)  # e1 / e8 kings of the start position
+    _mopup_jit(occ, pieces, 4, 60)
     _evaluate_jit(pieces, occ, 4, 60, True)
 
 
@@ -839,7 +919,7 @@ def _evaluate_reference(board: chess.Board) -> int:
     # int() truncates toward zero so the score stays exactly colour-symmetric; // would
     # round toward negative infinity and make a position and its mirror differ by 1.
     blended = mg_score * phase + eg_score * (TOTAL_PHASE - phase)
-    tapered = int(blended / TOTAL_PHASE)
+    tapered = int(blended / TOTAL_PHASE) + _mopup(board)
 
     return tapered if board.turn == chess.WHITE else -tapered
 
