@@ -92,11 +92,13 @@ def search_move(
     if not legal:
         return "0000"
     if len(legal) == 1:
+        _log_move(board, legal[0], 0, 0, time_left_ms, time.monotonic())
         return legal[0].uci()
 
     started = time.monotonic()
     deadline = started + _budget_s(board, time_left_ms, increment_ms)
     best = legal[0]
+    score = 0
     for depth in range(1, _MAX_DEPTH + 1):
         try:
             move, score = _search_root(board, depth, deadline, best)
@@ -111,7 +113,23 @@ def search_move(
             break  # forced mate found; a deeper search cannot improve on it
         if time.monotonic() >= deadline:
             break
+    _log_move(board, best, score, _last_depth, time_left_ms, started)
     return best.uci()
+
+
+def _log_move(
+    board: chess.Board, move: chess.Move, score: int, depth: int, clock_ms: int, started: float
+) -> None:
+    """One compact line per move to stderr, kept in the platform's per-game log so a rated
+    game can be diagnosed after the fact (real depth reached, nodes, time actually spent).
+    """
+    ms = (time.monotonic() - started) * 1000.0
+    tag = f"{board.fullmove_number}{'w' if board.turn else 'b'}"
+    print(
+        f"[{tag}] {move.uci()} d{depth} score {score:+d} nodes {_nodes} "
+        f"{ms:.0f}ms clock {clock_ms}",
+        flush=True,
+    )
 
 
 def _budget_s(board: chess.Board, time_left_ms: int, increment_ms: float) -> float:
