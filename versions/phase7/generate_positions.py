@@ -67,7 +67,7 @@ def play_random_opening(rng: random.Random, min_plies: int = 4, max_plies: int =
 
 def continue_with_engine(board: chess.Board, get_move_fn, rng: random.Random,
                           max_plies: int = 60, sample_every: int = 4,
-                          time_left_ms: int = 2000) -> list[str]:
+                          time_left_ms: int = 250) -> list[str]:
     """get_move_fn(fen, time_left_ms) -> uci string. Pass your real agent's
     get_move so generated positions reflect positions YOUR engine actually
     reaches, not some other distribution. Add a small amount of move noise
@@ -107,17 +107,7 @@ def generate_dataset(n_games: int, out_path: str, get_move_fn, seed: int = 0) ->
                 print(f"generated {game_id}/{n_games} games", file=sys.stderr)
 
 
-if __name__ == "__main__":
-    # Wire this to your real agent before running at scale:
-    #     import sys; sys.path.insert(0, "../../")  # path to your repo root
-    #     from agent import get_move
-    #     generate_dataset(n_games=2000, out_path="raw_positions.tsv", get_move_fn=get_move)
-    #
-    # Placeholder using random moves on both sides, so the file runs standalone
-    # for a smoke test -- replace before generating your real dataset.
-    def _dummy_get_move(fen: str, time_left_ms: int) -> str:
-        b = chess.Board(fen)
-        return random.choice(list(b.legal_moves)).uci()
-
-    generate_dataset(n_games=20, out_path="raw_positions_smoketest.tsv", get_move_fn=_dummy_get_move)
-    print("wrote raw_positions_smoketest.tsv -- inspect it, then swap in your real agent's get_move")
+import sys
+sys.path.insert(0, "../..")
+import agent
+generate_dataset(n_games=..., out_path="raw_positions.tsv", get_move_fn=agent.get_move)
