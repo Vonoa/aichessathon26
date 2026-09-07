@@ -211,13 +211,22 @@ MOPUP_KINGS_WEIGHT = 4  # per unit the winning king is closer than 7 (Chebyshev)
 SHIELD_PAWN_BONUS = 12
 OPEN_FILE_PENALTY = -22
 SEMI_OPEN_FILE_PENALTY = -12
-ATTACKER_ZONE_WEIGHT = {
+
+# Non-linear king attack: sum `unit * (king-zone squares the piece attacks)` over every
+# enemy piece bearing on the zone, count the attackers, then apply
+#   0 or 1 attacker -> -danger            (a lone piece is easily met)
+#   2+ attackers    -> -min(MAX, danger^2 * SCALE // 100)
+# so danger ramps quadratically with the number of pieces piling on, capped near a rook.
+# All first-guess values -- the arena calibrates them.
+KING_ATTACK_UNIT = {
     chess.PAWN: 2,
-    chess.KNIGHT: 6,
-    chess.BISHOP: 6,
-    chess.ROOK: 9,
-    chess.QUEEN: 14,
+    chess.KNIGHT: 3,
+    chess.BISHOP: 3,
+    chess.ROOK: 5,
+    chess.QUEEN: 7,
 }
+KING_DANGER_SCALE = 65
+KING_DANGER_MAX = 450
 
 _FILE_MASK = [0x0101010101010101 << f for f in range(8)]
 _KING_ZONE: list[int] = [chess.BB_SQUARES[sq] | chess.BB_KING_ATTACKS[sq] for sq in range(64)]
@@ -362,10 +371,18 @@ def _king_safety_mg(board: chess.Board, king_sq: int, color: bool, white: int, b
 
     zone = _KING_ZONE[king_sq]
     enemy_color = not color
-    for piece_type, weight in ATTACKER_ZONE_WEIGHT.items():
+    danger = 0
+    attackers = 0
+    for piece_type, unit in KING_ATTACK_UNIT.items():
         for sq in chess.scan_forward(board.pieces_mask(piece_type, enemy_color)):
-            if board.attacks_mask(sq) & zone:
-                score -= weight
+            hits = (board.attacks_mask(sq) & zone).bit_count()
+            if hits:
+                attackers += 1
+                danger += unit * hits
+    if attackers >= 2:
+        score -= min(KING_DANGER_MAX, danger * danger * KING_DANGER_SCALE // 100)
+    else:
+        score -= danger
 
     return score
 
@@ -654,10 +671,10 @@ _MOBILITY_EG_ARR: npt.NDArray[np.int16] = np.array(
     [0, MOBILITY_EG[chess.KNIGHT], MOBILITY_EG[chess.BISHOP],
      MOBILITY_EG[chess.ROOK], MOBILITY_EG[chess.QUEEN], 0], dtype=np.int16,
 )
-_ATTACKER_WEIGHT_ARR: npt.NDArray[np.int16] = np.array(
-    [ATTACKER_ZONE_WEIGHT[chess.PAWN], ATTACKER_ZONE_WEIGHT[chess.KNIGHT],
-     ATTACKER_ZONE_WEIGHT[chess.BISHOP], ATTACKER_ZONE_WEIGHT[chess.ROOK],
-     ATTACKER_ZONE_WEIGHT[chess.QUEEN], 0], dtype=np.int16,
+_KING_ATTACK_UNIT_ARR: npt.NDArray[np.int16] = np.array(
+    [KING_ATTACK_UNIT[chess.PAWN], KING_ATTACK_UNIT[chess.KNIGHT],
+     KING_ATTACK_UNIT[chess.BISHOP], KING_ATTACK_UNIT[chess.ROOK],
+     KING_ATTACK_UNIT[chess.QUEEN], 0], dtype=np.int16,
 )
 _KING_ZONE_ARR: npt.NDArray[np.uint64] = np.array(_KING_ZONE, dtype=np.uint64)
 # Shield / pawn-attack tables in this file's colour order: index 0 = White, 1 = Black.
@@ -747,8 +764,10 @@ def _king_safety_side(
             score += SEMI_OPEN_FILE_PENALTY
 
     zone = _KING_ZONE_ARR[king_sq]
+    danger = 0
+    attackers = 0
     for pt in range(5):  # PAWN, KNIGHT, BISHOP, ROOK, QUEEN
-        weight = int(_ATTACKER_WEIGHT_ARR[pt])
+        unit = int(_KING_ATTACK_UNIT_ARR[pt])
         bb = pieces[enemy, pt]
         while bb != np.uint64(0):
             lsb = bb & (~bb + np.uint64(1))
@@ -756,9 +775,18 @@ def _king_safety_side(
             # both branches are uint64, so the ternary is numba-safe here (unlike a
             # ternary that mixes an int with a promoted-to-float shift result)
             att = _PAWN_ATTACKS_ARR[enemy, sq] if pt == 0 else _piece_attacks(occ_all, sq, pt)
-            if (att & zone) != np.uint64(0):
-                score -= weight
+            hits = int(_popcount(att & zone))
+            if hits > 0:
+                attackers += 1
+                danger += unit * hits
             bb &= bb - np.uint64(1)
+    if attackers >= 2:
+        penalty = danger * danger * KING_DANGER_SCALE // 100
+        if penalty > KING_DANGER_MAX:
+            penalty = KING_DANGER_MAX
+        score -= penalty
+    else:
+        score -= danger
 
     return int(score)
 
