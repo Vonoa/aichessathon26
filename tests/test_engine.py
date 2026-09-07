@@ -140,6 +140,25 @@ def test_eval_is_colour_symmetric(fen: str) -> None:
     assert evaluate.evaluate(board) == evaluate.evaluate(board.mirror())
 
 
+# Exact outputs captured before the 5a-perf bitboard rewrite; the refactor must not move them.
+_EVAL_GOLDEN = {
+    "r1bq1rk1/pp2bppp/2n1pn2/2pp4/3P1B2/2PBPN2/PP1N1PPP/R2Q1RK1 w - - 0 9": 69,
+    "r3k2r/pppq1ppp/2np1n2/2b1p1B1/2B1P1b1/2NP1N2/PPPQ1PPP/R3K2R w KQkq - 0 1": 0,
+    "8/5pk1/6p1/7p/3R3P/6P1/5PK1/3r4 b - - 0 1": 8,
+    "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c6 0 2": 22,
+    "8/2k5/8/8/8/8/5K2/6R1 w - - 0 1": 540,
+    "8/1p3pk1/p5p1/3P4/2P5/6P1/5K2/8 w - - 0 1": -86,
+    "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N1P/1PP1QPP1/R4RK1 w - - 0 11": -2,
+    "2r3k1/5ppp/p7/1p1Pp3/8/1P3N2/P4PPP/3R2K1 b - - 0 1": -383,
+    "r1b1k2r/ppppqppp/2n2n2/2b5/4P3/2N2N2/PPPP1PPP/R1BQK2R w KQkq - 6 6": -262,
+}
+
+
+@pytest.mark.parametrize(("fen", "expected"), list(_EVAL_GOLDEN.items()))
+def test_eval_golden_values(fen: str, expected: int) -> None:
+    assert evaluate.evaluate(chess.Board(fen)) == expected
+
+
 def test_eval_start_position_is_balanced() -> None:
     assert evaluate.evaluate(chess.Board()) == 0
 

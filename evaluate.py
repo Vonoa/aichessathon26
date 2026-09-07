@@ -236,20 +236,20 @@ def _game_phase(board: chess.Board) -> int:
     """Non-pawn material still on the board: 24 at the start (pure midgame), 0 at bare
     kings (pure endgame). evaluate() blends mg_score by phase and eg_score by 24 - phase.
     """
-    phase = 0
-    for piece_type, weight in PHASE_WEIGHTS.items():
-        phase += weight * (
-            len(board.pieces(piece_type, chess.WHITE))
-            + len(board.pieces(piece_type, chess.BLACK))
-        )
+    phase = (
+        PHASE_WEIGHTS[chess.KNIGHT] * board.knights.bit_count()
+        + PHASE_WEIGHTS[chess.BISHOP] * board.bishops.bit_count()
+        + PHASE_WEIGHTS[chess.ROOK] * board.rooks.bit_count()
+        + PHASE_WEIGHTS[chess.QUEEN] * board.queens.bit_count()
+    )
     return min(TOTAL_PHASE, phase)
 
 
 def _pawn_structure(board: chess.Board, color: bool) -> int:
     score = 0
-    pawns = board.pieces(chess.PAWN, color)
+    pawns = board.pawns & board.occupied_co[color]
     files = [0] * 8
-    for sq in pawns:
+    for sq in chess.scan_forward(pawns):
         files[chess.square_file(sq)] += 1
 
     for f in range(8):
@@ -260,12 +260,12 @@ def _pawn_structure(board: chess.Board, color: bool) -> int:
             if neighbours == 0:
                 score += ISOLATED_PAWN_PENALTY * files[f]
 
-    enemy_pawns = board.pieces(chess.PAWN, not color)
+    enemy_pawns = board.pawns & board.occupied_co[not color]
     enemy_files_by_rank: dict[int, list[int]] = {}
-    for sq in enemy_pawns:
+    for sq in chess.scan_forward(enemy_pawns):
         enemy_files_by_rank.setdefault(chess.square_file(sq), []).append(chess.square_rank(sq))
 
-    for sq in pawns:
+    for sq in chess.scan_forward(pawns):
         f, r = chess.square_file(sq), chess.square_rank(sq)
         blocked = False
         for nf in (f - 1, f, f + 1):
@@ -285,10 +285,12 @@ def _mobility(board: chess.Board, color: bool) -> tuple[int, int]:
     mg = 0
     eg = 0
     for piece_type in (chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN):
-        for sq in board.pieces(piece_type, color):
-            n_moves = chess.popcount(board.attacks_mask(sq))
-            mg += MOBILITY_MG[piece_type] * n_moves
-            eg += MOBILITY_EG[piece_type] * n_moves
+        weight_mg = MOBILITY_MG[piece_type]
+        weight_eg = MOBILITY_EG[piece_type]
+        for sq in chess.scan_forward(board.pieces_mask(piece_type, color)):
+            n_moves = board.attacks_mask(sq).bit_count()
+            mg += weight_mg * n_moves
+            eg += weight_eg * n_moves
     return mg, eg
 
 
@@ -320,17 +322,23 @@ def _king_safety_mg(board: chess.Board, king_sq: int, color: bool, white: int, b
     zone = _KING_ZONE[king_sq]
     enemy_color = not color
     for piece_type, weight in ATTACKER_ZONE_WEIGHT.items():
-        for sq in board.pieces(piece_type, enemy_color):
+        for sq in chess.scan_forward(board.pieces_mask(piece_type, enemy_color)):
             if board.attacks_mask(sq) & zone:
                 score -= weight
 
     return score
 
 
+_PIECE_TYPES = (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING)
+
+
 def evaluate(board: chess.Board) -> int:
-    """Tapered eval, centipawns, from side-to-move's perspective (negamax convention)."""
-    if board.is_checkmate():
-        return -100_000  # safety net; search's mate-distance logic should pre-empt this
+    """Tapered eval, centipawns, from side-to-move's perspective (negamax convention).
+
+    The search never calls this on a checkmate (it returns a mate score for a node with no
+    legal moves), so there is no is_checkmate() guard here - it would be a wasted movegen
+    at every leaf.
+    """
     if board.is_stalemate() or board.is_insufficient_material():
         return 0
 
@@ -339,14 +347,17 @@ def evaluate(board: chess.Board) -> int:
     mg_score = 0
     eg_score = 0
 
-    for square, piece in board.piece_map().items():
-        value = PIECE_VALUES[piece.piece_type]
-        idx = square if piece.color == chess.WHITE else _mirror(square)
-        pst_mg = PST_MG[piece.piece_type][idx]
-        pst_eg = PST_EG[piece.piece_type][idx]
-        sign = 1 if piece.color == chess.WHITE else -1
-        mg_score += sign * (value + pst_mg)
-        eg_score += sign * (value + pst_eg)
+    for piece_type in _PIECE_TYPES:
+        value = PIECE_VALUES[piece_type]
+        table_mg = PST_MG[piece_type]
+        table_eg = PST_EG[piece_type]
+        for sq in chess.scan_forward(board.pieces_mask(piece_type, chess.WHITE)):
+            mg_score += value + table_mg[sq]
+            eg_score += value + table_eg[sq]
+        for sq in chess.scan_forward(board.pieces_mask(piece_type, chess.BLACK)):
+            idx = _mirror(sq)
+            mg_score -= value + table_mg[idx]
+            eg_score -= value + table_eg[idx]
 
     white = board.occupied_co[chess.WHITE]
     black = board.occupied_co[chess.BLACK]
