@@ -336,16 +336,15 @@ _PIECE_TYPES = (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN,
 
 
 # ---------------------------------------------------------------------------
-# Jitted evaluation, step 1: board encoding + classical ray attacks + warm-up.
-#
-# The tapered eval above still runs the search (see evaluate()); this block is the
-# scaffold the jitted port is built on, one verifiable increment at a time:
-#   1 (here) _encode + _ray_attacks + import-time warm-up
-#   2        jitted material + tapered PST
-#   3        jitted pawn structure
-#   4        jitted mobility + king safety (via _ray_attacks -- the speed win)
-#   5        evaluate() calls the jitted path; this file's old body becomes the
-#            _evaluate_reference used by tests/test_engine.py's golden values.
+# Jitted evaluation. The tapered eval above still runs the search (see evaluate());
+# this block is the jitted port, built as one verifiable increment per commit:
+#   1  _encode + _ray_attacks + import-time warm-up                        [done]
+#   2  jitted material + tapered PST                                       [done]
+#   3  jitted pawn structure
+#   4  jitted mobility + king safety (via _ray_attacks -- the speed win)
+#   5  evaluate() calls the jitted path; this file's old body becomes the
+#      _evaluate_reference used by tests/test_engine.py's golden values.
+# Each kernel is pinned against the Python eval above by tests/test_evaljit.py.
 # ---------------------------------------------------------------------------
 
 # One uint64 per square, so the jitted code indexes a table instead of doing
@@ -413,13 +412,103 @@ def _encode(
     return pieces, occ, board.turn
 
 
+# --- step 2: material + tapered PST -----------------------------------------
+#
+# The Python tables above, baked into fixed arrays the jitted kernels read. Rows
+# follow _PIECE_TYPES order: 0 = pawn ... 5 = king, matching _encode()'s pieces[c].
+# PST_MG / PST_EG are already _flip_ranks'd (a1 = 0), so the jit indexes `sq`
+# directly for White and `sq ^ 56` for Black -- no second flip.
+_PIECE_VALUE_ARR: npt.NDArray[np.int16] = np.array(
+    [PIECE_VALUES[pt] for pt in _PIECE_TYPES], dtype=np.int16
+)
+_PST_MG: npt.NDArray[np.int16] = np.array(
+    [PST_MG[pt] for pt in _PIECE_TYPES], dtype=np.int16
+)
+_PST_EG: npt.NDArray[np.int16] = np.array(
+    [PST_EG[pt] for pt in _PIECE_TYPES], dtype=np.int16
+)
+
+
+@njit(cache=False)
+def _popcount(bb: np.uint64) -> int:
+    """SWAR population count -- all-uint64 so numba never sees a mixed-width shift."""
+    bb = bb - ((bb >> np.uint64(1)) & np.uint64(0x5555555555555555))
+    bb = (bb & np.uint64(0x3333333333333333)) + (
+        (bb >> np.uint64(2)) & np.uint64(0x3333333333333333)
+    )
+    bb = (bb + (bb >> np.uint64(4))) & np.uint64(0x0F0F0F0F0F0F0F0F)
+    return int((bb * np.uint64(0x0101010101010101)) >> np.uint64(56))
+
+
+@njit(cache=False)
+def _game_phase_jit(pieces: npt.NDArray[np.uint64]) -> int:
+    """Non-pawn material on the board: 24 at the start (midgame), 0 at bare kings.
+    Mirrors evaluate._game_phase -- N/B weight 1, R weight 2, Q weight 4, capped at 24.
+    """
+    knights = _popcount(pieces[0, 1] | pieces[1, 1])
+    bishops = _popcount(pieces[0, 2] | pieces[1, 2])
+    rooks = _popcount(pieces[0, 3] | pieces[1, 3])
+    queens = _popcount(pieces[0, 4] | pieces[1, 4])
+    phase = knights + bishops + 2 * rooks + 4 * queens
+    return 24 if phase > 24 else phase
+
+
+@njit(cache=False)
+def _material_pst(
+    pieces: npt.NDArray[np.uint64],
+    values: npt.NDArray[np.int16],
+    pst_mg: npt.NDArray[np.int16],
+    pst_eg: npt.NDArray[np.int16],
+) -> tuple[int, int]:
+    """(mg, eg) material + piece-square sums, White-positive. Black squares are
+    mirrored (sq ^ 56) and subtracted, exactly as evaluate()'s piece loop does.
+    """
+    mg = 0
+    eg = 0
+    for pt in range(6):
+        v = int(values[pt])
+        white_bb = pieces[0, pt]
+        black_bb = pieces[1, pt]
+        for sq in range(64):
+            bit = _BB_SQUARES[sq]
+            if (white_bb & bit) != np.uint64(0):
+                mg += v + int(pst_mg[pt, sq])
+                eg += v + int(pst_eg[pt, sq])
+            if (black_bb & bit) != np.uint64(0):
+                idx = sq ^ 56
+                mg -= v + int(pst_mg[pt, idx])
+                eg -= v + int(pst_eg[pt, idx])
+    return mg, eg
+
+
+@njit(cache=False)
+def _eval_material_pst_tapered(
+    pieces: npt.NDArray[np.uint64],
+    values: npt.NDArray[np.int16],
+    pst_mg: npt.NDArray[np.int16],
+    pst_eg: npt.NDArray[np.int16],
+) -> int:
+    """Step-2 entry point: material + tapered PST only, White-positive (no side-to-move
+    flip yet). Grows into the full jitted eval as steps 3-4 land. Blend matches
+    evaluate() -- int(.../24) truncation toward zero keeps the score colour-symmetric.
+    """
+    phase = _game_phase_jit(pieces)
+    mg, eg = _material_pst(pieces, values, pst_mg, pst_eg)
+    blended = mg * phase + eg * (24 - phase)
+    return int(blended / 24)
+
+
 def _warm_up() -> None:
-    """Compile the jitted primitives at import, with the exact dtypes the search feeds
+    """Compile the jitted kernels at import, with the exact dtypes the search feeds
     them, so numba never compiles on the clock (its `/tmp` cache is wiped per game).
     """
     occ = np.uint64(0x00FF00000000FF00)
     for dirs in (_BISHOP_DIRS, _ROOK_DIRS, _QUEEN_DIRS):
         _ray_attacks(occ, 27, dirs)
+    pieces, _occ, _turn = _encode(chess.Board())
+    _popcount(np.uint64(0xFFFF00000000FFFF))
+    _game_phase_jit(pieces)
+    _eval_material_pst_tapered(pieces, _PIECE_VALUE_ARR, _PST_MG, _PST_EG)
 
 
 _warm_up()

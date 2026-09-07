@@ -6,6 +6,7 @@ tapered eval (evaluate.py) is ported onto them. tests/ is never packaged.
 
 import chess
 import numpy as np
+import pytest
 
 import evaluate
 
@@ -16,6 +17,20 @@ _OCC_FENS = [
     "8/5pk1/6p1/7p/3R3P/6P1/5PK1/3r4 b - - 0 1",
     "r3k2r/pppq1ppp/2np1n2/2b1p1B1/2B1P1b1/2NP1N2/PPPQ1PPP/R3K2R w KQkq - 0 1",
     "8/2k5/8/8/8/8/5K2/6R1 w - - 0 1",
+]
+
+# The golden FENs from tests/test_engine.py plus a couple of lopsided ones, so the
+# jitted material+PST slice is exercised across the phase range and both signs.
+_EVAL_FENS = [
+    chess.STARTING_FEN,
+    "r1bq1rk1/pp2bppp/2n1pn2/2pp4/3P1B2/2PBPN2/PP1N1PPP/R2Q1RK1 w - - 0 9",
+    "r3k2r/pppq1ppp/2np1n2/2b1p1B1/2B1P1b1/2NP1N2/PPPQ1PPP/R3K2R w KQkq - 0 1",
+    "8/5pk1/6p1/7p/3R3P/6P1/5PK1/3r4 b - - 0 1",
+    "8/2k5/8/8/8/8/5K2/6R1 w - - 0 1",
+    "8/1p3pk1/p5p1/3P4/2P5/6P1/5K2/8 w - - 0 1",
+    "2r3k1/5ppp/p7/1p1Pp3/8/1P3N2/P4PPP/3R2K1 b - - 0 1",
+    "4k3/8/8/8/8/8/8/3QK3 w - - 0 1",
+    "3rk3/8/8/8/4N3/8/8/3RK3 w - - 0 1",
 ]
 
 
@@ -68,3 +83,72 @@ def test_encode_matches_board() -> None:
         for pt in range(1, 7):
             assert int(pieces[0, pt - 1]) == board.pieces_mask(pt, chess.WHITE)
             assert int(pieces[1, pt - 1]) == board.pieces_mask(pt, chess.BLACK)
+
+
+# --- step 2: material + tapered PST ---------------------------------------------
+
+
+_POPCOUNT_CASES = [
+    0,
+    1,
+    2,
+    0xFF,
+    0x8000000000000000,
+    0xFFFFFFFFFFFFFFFF,
+    0x00FF00000000FF00,
+    0xDEADBEEFCAFEF00D,
+]
+
+
+@pytest.mark.parametrize("value", _POPCOUNT_CASES)
+def test_popcount_matches_bit_count(value: int) -> None:
+    assert evaluate._popcount(np.uint64(value)) == value.bit_count()
+
+
+@pytest.mark.parametrize("fen", _EVAL_FENS)
+def test_game_phase_jit_matches_reference(fen: str) -> None:
+    board = chess.Board(fen)
+    pieces, _occ, _turn = evaluate._encode(board)
+    assert evaluate._game_phase_jit(pieces) == evaluate._game_phase(board)
+
+
+def _material_pst_reference(board: chess.Board) -> int:
+    """The material + tapered-PST slice of evaluate(), White-positive, no side flip."""
+    phase = evaluate._game_phase(board)
+    mg = eg = 0
+    for pt in evaluate._PIECE_TYPES:
+        value = evaluate.PIECE_VALUES[pt]
+        tmg, teg = evaluate.PST_MG[pt], evaluate.PST_EG[pt]
+        for sq in chess.scan_forward(board.pieces_mask(pt, chess.WHITE)):
+            mg += value + tmg[sq]
+            eg += value + teg[sq]
+        for sq in chess.scan_forward(board.pieces_mask(pt, chess.BLACK)):
+            idx = sq ^ 56
+            mg -= value + tmg[idx]
+            eg -= value + teg[idx]
+    blended = mg * phase + eg * (evaluate.TOTAL_PHASE - phase)
+    return int(blended / evaluate.TOTAL_PHASE)
+
+
+@pytest.mark.parametrize("fen", _EVAL_FENS)
+def test_jitted_material_pst_matches_reference(fen: str) -> None:
+    board = chess.Board(fen)
+    pieces, _occ, _turn = evaluate._encode(board)
+    got = evaluate._eval_material_pst_tapered(
+        pieces, evaluate._PIECE_VALUE_ARR, evaluate._PST_MG, evaluate._PST_EG
+    )
+    assert got == _material_pst_reference(board)
+
+
+def test_jitted_material_pst_is_colour_symmetric() -> None:
+    for fen in _EVAL_FENS:
+        board = chess.Board(fen)
+        pieces, _o, _t = evaluate._encode(board)
+        mpieces, _o2, _t2 = evaluate._encode(board.mirror())
+        forward = evaluate._eval_material_pst_tapered(
+            pieces, evaluate._PIECE_VALUE_ARR, evaluate._PST_MG, evaluate._PST_EG
+        )
+        mirrored = evaluate._eval_material_pst_tapered(
+            mpieces, evaluate._PIECE_VALUE_ARR, evaluate._PST_MG, evaluate._PST_EG
+        )
+        assert forward == -mirrored
