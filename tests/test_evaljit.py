@@ -303,11 +303,20 @@ def test_mobility_and_king_safety_jit_are_colour_symmetric() -> None:
 
 # --- step 5: evaluate() runs the jitted path ------------------------------------
 
+# KX-vs-K positions to exercise the mate driver (evaluate._mopup / _mopup_jit).
+_KX_FENS = [
+    "8/2k5/8/8/8/8/5K2/6R1 w - - 0 1",   # KR vs K, Black bare
+    "7k/8/6K1/8/8/8/8/7Q w - - 0 1",     # KQ vs K, Black bare, kings close
+    "4k3/8/8/8/8/8/8/Q3K3 w - - 0 1",    # KQ vs K, Black bare, kings far
+    "1R6/8/8/4k3/8/8/2K5/8 b - - 0 1",   # KR vs K, Black bare, Black to move
+    "8/8/8/3k4/8/3K4/8/7q w - - 0 1",    # KQ vs K, White bare
+]
+
 # Every FEN this file exercises, plus the test_engine.py golden set, plus terminal
 # positions so the stalemate / insufficient-material guard and the kingless fallback
 # are covered too.
 _EQUIV_FENS = [
-    *dict.fromkeys(_OCC_FENS + _EVAL_FENS + _PAWN_FENS + _MOB_KS_FENS),
+    *dict.fromkeys(_OCC_FENS + _EVAL_FENS + _PAWN_FENS + _MOB_KS_FENS + _KX_FENS),
     "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c6 0 2",
     "r1b1k2r/ppppqppp/2n2n2/2b5/4P3/2N2N2/PPPP1PPP/R1BQK2R w KQkq - 6 6",
     "7k/8/8/8/8/8/8/5B1K w - - 0 1",       # KB vs K: insufficient material -> 0
@@ -315,6 +324,16 @@ _EQUIV_FENS = [
     "4k3/8/8/8/8/8/8/4K2R w - - 0 1",      # KR vs K, not terminal
     "8/8/8/4k3/8/2K5/8/8 w - - 0 1",       # bare kings (insufficient) -> 0
 ]
+
+
+@pytest.mark.parametrize("fen", _KX_FENS)
+def test_mopup_jit_matches_reference(fen: str) -> None:
+    board = chess.Board(fen)
+    pieces, occ, _turn = evaluate._encode(board)
+    white_king = board.king(chess.WHITE)
+    black_king = board.king(chess.BLACK)
+    assert white_king is not None and black_king is not None
+    assert evaluate._mopup_jit(occ, pieces, white_king, black_king) == evaluate._mopup(board)
 
 
 @pytest.mark.parametrize("fen", _EQUIV_FENS)
