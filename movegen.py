@@ -119,6 +119,52 @@ def _king_sq(bb: npt.NDArray[np.uint64], colour: int) -> int:
 
 
 @njit(cache=False)
+def _occ3(bb: npt.NDArray[np.uint64], out: npt.NDArray[np.uint64]) -> None:
+    """Fill `out` (len 3) with [white occ, black occ, all occ] -- the shape evaluate's
+    jitted path expects."""
+    out[0] = _occ_of(bb, 0)
+    out[1] = _occ_of(bb, 1)
+    out[2] = out[0] | out[1]
+
+
+# --- Zobrist hashing ---------------------------------------------------------------
+#
+# One 64-bit key per position, so the search's transposition table and repetition
+# detection can work off (bb, state) without a python-chess board. Deterministically
+# seeded -- the finals panel needs a reproducible engine.
+_zrng = np.random.default_rng(0x5C4013A7)
+_ZOBRIST_PIECE: npt.NDArray[np.uint64] = _zrng.integers(
+    0, 1 << 64, size=(2, 6, 64), dtype=np.uint64
+)
+_ZOBRIST_CASTLING: npt.NDArray[np.uint64] = _zrng.integers(0, 1 << 64, size=16, dtype=np.uint64)
+_ZOBRIST_EP: npt.NDArray[np.uint64] = _zrng.integers(0, 1 << 64, size=8, dtype=np.uint64)
+_ZOBRIST_TURN = np.uint64(_zrng.integers(0, 1 << 64, dtype=np.uint64))
+
+
+@njit(cache=False)
+def _zobrist(bb: npt.NDArray[np.uint64], state: npt.NDArray[np.int64]) -> np.uint64:
+    h = np.uint64(0)
+    for c in range(2):
+        for pt in range(6):
+            b = bb[c, pt]
+            while b != np.uint64(0):
+                h ^= _ZOBRIST_PIECE[c, pt, _lsb_sq(b)]
+                b &= b - _U1
+    h ^= _ZOBRIST_CASTLING[int(state[1]) & 15]
+    ep = int(state[2])
+    if ep >= 0:
+        turn = int(state[0])
+        # matches python-chess: the ep square only distinguishes the position if the side
+        # to move actually has a pawn that could capture there
+        capper = _BPAWN_ATK[ep] if turn == 0 else _WPAWN_ATK[ep]
+        if (capper & bb[turn, 0]) != np.uint64(0):
+            h ^= _ZOBRIST_EP[ep & 7]
+    if int(state[0]) == 1:
+        h ^= _ZOBRIST_TURN
+    return np.uint64(h)
+
+
+@njit(cache=False)
 def _attacked_by(bb: npt.NDArray[np.uint64], occ: np.uint64, sq: int, by: int) -> bool:
     """Is `sq` attacked by any piece of colour `by`, given occupancy `occ`?"""
     if (_KNIGHT_ATK[sq] & bb[by, 1]) != np.uint64(0):
@@ -136,8 +182,8 @@ def _attacked_by(bb: npt.NDArray[np.uint64], occ: np.uint64, sq: int, by: int) -
 
 
 @njit(cache=False)
-def _mv(frm: int, to: int, promo: int, flag: int) -> np.int32:
-    return np.int32(frm | (to << 6) | (promo << 12) | (flag << 15))
+def _mv(frm: int, to: int, promo: int, flag: int) -> int:
+    return frm | (to << 6) | (promo << 12) | (flag << 15)
 
 
 # --- pseudo-legal generation ---------------------------------------------------
@@ -317,8 +363,8 @@ def _rook_hop_to(to: int) -> int:
 
 @njit(cache=False)
 def _make(
-    bb: npt.NDArray[np.uint64], state: npt.NDArray[np.int64], mv: np.int32
-) -> np.int64:
+    bb: npt.NDArray[np.uint64], state: npt.NDArray[np.int64], mv: int
+) -> int:
     """Apply `mv` in place; return an undo word for _unmake."""
     m = int(mv)
     frm = m & 0x3F
@@ -340,9 +386,7 @@ def _make(
         cap_sq = to
         cappt = _piece_at(bb, enemy, to)
 
-    undo = np.int64(
-        cappt | (cap_sq << 3) | ((old_ep + 1) << 9) | (old_castling << 16) | (old_half << 20)
-    )
+    undo = cappt | (cap_sq << 3) | ((old_ep + 1) << 9) | (old_castling << 16) | (old_half << 20)
 
     if cappt != 0:
         bb[enemy, cappt - 1] &= ~_BIT[cap_sq]
@@ -392,8 +436,8 @@ def _make(
 def _unmake(
     bb: npt.NDArray[np.uint64],
     state: npt.NDArray[np.int64],
-    mv: np.int32,
-    undo: np.int64,
+    mv: int,
+    undo: int,
 ) -> None:
     m = int(mv)
     frm = m & 0x3F
@@ -456,18 +500,18 @@ def _gen_legal(
 
 
 @njit(cache=False)
-def _perft(bb: npt.NDArray[np.uint64], state: npt.NDArray[np.int64], depth: int) -> np.int64:
+def _perft(bb: npt.NDArray[np.uint64], state: npt.NDArray[np.int64], depth: int) -> int:
     if depth == 0:
-        return np.int64(1)
+        return 1
     out = np.empty(_MAX_MOVES, dtype=np.int32)
     n = _gen(bb, state, out)
-    total = np.int64(0)
+    total = 0
     mover = int(state[0])
     for i in range(n):
         undo = _make(bb, state, out[i])
         occ = _occ_of(bb, 0) | _occ_of(bb, 1)
         if not _attacked_by(bb, occ, _king_sq(bb, mover), 1 - mover):
-            total += np.int64(1) if depth == 1 else _perft(bb, state, depth - 1)
+            total += 1 if depth == 1 else _perft(bb, state, depth - 1)
         _unmake(bb, state, out[i], undo)
     return total
 
@@ -514,6 +558,13 @@ def perft(board: chess.Board, depth: int) -> int:
     return int(_perft(bb, state, depth))
 
 
+def zobrist(board: chess.Board) -> int:
+    """The 64-bit position key for a chess.Board -- used to seed the search's history so
+    repetition detection can run off the bitboard state."""
+    bb, state = encode(board)
+    return int(_zobrist(bb, state))
+
+
 def legal_ucis(board: chess.Board) -> set[str]:
     """The jitted legal-move set as UCI strings, for validating against python-chess."""
     bb, state = encode(board)
@@ -543,8 +594,11 @@ def _warm_up() -> None:
     """
     bb, state = encode(chess.Board())
     out: npt.NDArray[np.int32] = np.empty(_MAX_MOVES, dtype=np.int32)
+    occ3: npt.NDArray[np.uint64] = np.empty(3, dtype=np.uint64)
     _gen(bb, state, out)
     _gen_legal(bb, state, out)
+    _occ3(bb, occ3)
+    _zobrist(bb, state)
     undo = _make(bb, state, out[0])
     _unmake(bb, state, out[0], undo)
 

@@ -408,3 +408,31 @@ lost game).
 - **Not integrated.** Phase B decides how deep to wire it into the search -- the real
   win needs the search to carry a lightweight board the whole way down, not push/pop a
   chess.Board per node.
+
+### 2026-09-08 -- Jitted move generator wired into the search, Phase B (branch `jit-movegen`)
+
+The search now runs on `movegen.py`'s bitboard board: `(bb, state)` numpy arrays,
+`_gen_legal` / `_make` / `_unmake` in place of `board.legal_moves` / `push` / `pop`,
+`_zobrist` for the TT and repetition keys, `_attacked_by` for check detection, and
+`evaluate._evaluate_jit` read straight off `bb`. A `chess.Board` is touched only at the
+root -- parse the FEN, probe Syzygy, format the UCI reply. `agent.py` keys `_history` by
+`movegen.zobrist`.
+
+- **Sub-steps, each validated:** eval bridge == `evaluate.evaluate` over 8,432 positions
+  (0 mismatch); Zobrist transposition-consistent + make/unmake round-trips + deterministic;
+  search score == old python-chess search on **561/562 positions at fixed depth 3**
+  (worst gap 31 cp, the known LMR-fail-soft ordering effect). Move matches 69% -- the
+  rest are equal-value alternatives (the generator's move order differs from
+  python-chess's, so the stable-sort tie-break picks differently).
+- **Speed: ~2.4x nps, +1-2 plies.** Bench: open middlegame d3->d4 (~22k->49k nps),
+  sharp middlegame d3->d5 (~25k->60k), rook endgame d7->d8 (~30k->74k). Base node cost
+  ~40 us -> ~15 us.
+- `search.warm_up()` runs one tiny search at import so numba compiles the whole path in
+  the ~14 s import, not on move one. First real move: d3 in 188 ms, no compile stall.
+- `_insufficient` is a coarse jitted check (KvK, K+minor vs K); same-colour KBvKB and
+  KNNvK fall through to the eval / repetition -- rare, never a blunder.
+- Tests: the six search-internal tests rewritten to the `(bb, state)` interface; gate
+  green (245 pass, 1 xfail).
+- **Still open:** SEE / NMP un-parked on the fast substrate (both should flip positive
+  now); a full arena vs `versions/phase5jit` + `make zip` smoke before any upload;
+  `docs/ENGINE.md` / `PLAN.md` describe the old python-chess search and need a rewrite.
