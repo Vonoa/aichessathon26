@@ -43,6 +43,8 @@ _EXACT, _LOWER, _UPPER = 0, 1, 2  # transposition-table bound kinds
 _LMR_MIN_DEPTH = 3  # only reduce late moves with this much depth left
 _LMR_MIN_MOVE = 3  # first this many moves at each node are searched at full depth
 _ASPIRATION = 40  # centipawns; the half-width of the first window around the last score
+_NMP_MIN_DEPTH = 3  # only try a null move with at least this much depth left
+_SEE_QS_MARGIN = 90  # quiescence keeps a capture unless SEE is worse than -this
 
 # Syzygy endgame tablebases. When the board is down to this few men and ./syzygy holds
 # the files, search_move picks the move straight from the tables (WDL for the outcome,
@@ -164,6 +166,12 @@ def _insufficient(bb: npt.NDArray[np.uint64]) -> bool:
 def _repeats(key: int, ply: int) -> bool:
     """Has this exact key already appeared higher in the current line?"""
     return any(int(_PATH[j]) == key for j in range(ply))
+
+
+def _has_non_pawn_material(bb: npt.NDArray[np.uint64], turn: int) -> bool:
+    """True if `turn` has a knight, bishop, rook or queen -- null-move pruning is unsafe
+    without one (in a king-and-pawns position, passing can be forced-best: zugzwang)."""
+    return bool(int(bb[turn, 1] | bb[turn, 2] | bb[turn, 3] | bb[turn, 4]))
 
 
 # --- iterative deepening at the root ---------------------------------------------
@@ -350,6 +358,28 @@ def _negamax(
             if e_flag == _UPPER and e_value <= alpha:
                 return e_value
 
+    # Null-move pruning: hand the opponent a free move and search shallower; if we are
+    # still >= beta even a tempo down, the real search would only confirm the cutoff.
+    # Gated on the static eval already being >= beta (without it the null search is pure
+    # overhead in every equal-or-worse position), not in check, not when beta is a mate
+    # score, and not when the side to move has only pawns (zugzwang).
+    if (
+        not in_check
+        and depth >= _NMP_MIN_DEPTH
+        and abs(beta) < _MATE_THRESHOLD
+        and _has_non_pawn_material(bb, turn)
+        and _eval_bb(bb, state) >= beta
+    ):
+        r = 3 if depth >= 6 else 2
+        old_turn, old_ep, old_half = int(state[0]), int(state[2]), int(state[3])
+        state[0] = 1 - old_turn
+        state[2] = -1
+        state[3] = old_half + 1
+        null_score = -_negamax(bb, state, depth - 1 - r, ply + 1, -beta, -beta + 1, deadline)
+        state[0], state[2], state[3] = old_turn, old_ep, old_half
+        if null_score >= beta:
+            return beta if null_score >= _MATE_THRESHOLD else null_score
+
     enemy_occ = int(movegen._occ_of(bb, 1 - turn))
     ordered = _ordered(bb, turn, enemy_occ, _MBUF[ply][:n].tolist(), ply, tt_move)
 
@@ -459,10 +489,24 @@ def _qsearch(
         for i in range(n):
             code = int(_MBUF[ply][i])
             to = (code >> 6) & 0x3F
+            frm = code & 0x3F
             flag = (code >> 15) & 7
             promo = (code >> 12) & 7
-            if promo != 0 or flag == 2 or ((enemy_occ >> to) & 1):
-                captures.append(code)
+            is_cap = flag == 2 or ((enemy_occ >> to) & 1)
+            if promo != 0:
+                captures.append(code)  # promotions always resolved
+            elif is_cap:
+                victim = _pt_at(bb, 1 - turn, to) if flag != 2 else chess.PAWN
+                attacker = _pt_at(bb, turn, frm)
+                # capturing equal-or-up is structurally safe; only SEE the "capturing
+                # down" moves, where a losing capture hides. Keep any capture giving check.
+                if victim >= attacker or movegen._see(bb, turn, code) >= -_SEE_QS_MARGIN:
+                    captures.append(code)
+                else:
+                    undo = movegen._make(bb, state, code)
+                    if _in_check(bb, state):
+                        captures.append(code)
+                    movegen._unmake(bb, state, code, undo)
             elif want_checks and len(checks) < _QS_CHECK_CAP:
                 undo = movegen._make(bb, state, code)
                 if _in_check(bb, state):

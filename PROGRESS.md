@@ -436,3 +436,25 @@ root -- parse the FEN, probe Syzygy, format the UCI reply. `agent.py` keys `_his
 - **Still open:** SEE / NMP un-parked on the fast substrate (both should flip positive
   now); a full arena vs `versions/phase5jit` + `make zip` smoke before any upload;
   `docs/ENGINE.md` / `PLAN.md` describe the old python-chess search and need a rewrite.
+
+### 2026-09-08 -- SEE + null-move pruning on the jitted substrate (branch `jit-movegen`)
+
+Both were parked at ~break-even on the old python-chess search (a node was ~40 us so the
+per-node cost swallowed the pruning). Re-added now that a node is ~15 us.
+
+- **NMP.** In `_negamax` after the TT probe: not in check, `depth >= _NMP_MIN_DEPTH` (3),
+  beta not a mate score, side to move has a piece (`_has_non_pawn_material` -- the
+  zugzwang guard), and static eval already `>= beta`. Flip `state[0]`/ep, search
+  `depth - 1 - r` (r = 3 at depth >= 6 else 2) zero-window at beta; a fail-high prunes.
+- **SEE.** `movegen._see(bb, turn, code)` -- a jitted static exchange evaluation with
+  x-ray, `_attackers_to` off the ray tables. Quiescence drops a non-promo capture whose
+  SEE is worse than `-_SEE_QS_MARGIN` (90), unless it captures equal-or-up (structurally
+  safe, skip the call) or gives check.
+- **Bench, isolated:** NMP alone takes the rook endgame d8 -> d10 at no nps cost (it
+  finally pays -- reaches the depth where R=3 compounds). SEE alone is ~3% nps, no bench
+  depth change (its value is tactical -- not misevaluating a losing-capture line). Both
+  together: open middlegame d4 -> d5, rook d8 -> d10, sharp unchanged; overall nps
+  64k -> 60k.
+- SEE unit-tested (undefended / defended / x-ray / en passant); NMP tested to cut nodes
+  without changing the score; `_has_non_pawn_material` tested. Gate green (249 pass).
+- Arena vs `versions/phase5jit` pending, then the rated ladder.
