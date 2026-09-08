@@ -312,11 +312,21 @@ _KX_FENS = [
     "8/8/8/3k4/8/3K4/8/7q w - - 0 1",    # KQ vs K, White bare
 ]
 
+# Endgames with a material lead and a non-bare trailing king, to exercise the king-
+# activity term (evaluate._king_activity / _king_activity_jit).
+_ENDGAME_FENS = [
+    "8/5k2/4p3/8/8/3K4/5R2/8 w - - 0 1",     # White up a rook, Black K + pawn
+    "8/5k2/8/2q5/8/5K2/6P1/8 w - - 0 1",     # Black up a queen, White K + pawn
+    "8/8/4k3/8/3p4/3P4/4K3/2R5 b - - 0 1",   # White up a rook, pawns each side
+    "8/3k4/8/8/2n5/8/1p6/3K4 w - - 0 1",     # Black up a knight + pawn, White bare -> silent
+    "8/2k5/8/3p4/3P4/8/2K5/8 w - - 0 1",     # level pawn ending -> silent
+]
+
 # Every FEN this file exercises, plus the test_engine.py golden set, plus terminal
 # positions so the stalemate / insufficient-material guard and the kingless fallback
 # are covered too.
 _EQUIV_FENS = [
-    *dict.fromkeys(_OCC_FENS + _EVAL_FENS + _PAWN_FENS + _MOB_KS_FENS + _KX_FENS),
+    *dict.fromkeys(_OCC_FENS + _EVAL_FENS + _PAWN_FENS + _MOB_KS_FENS + _KX_FENS + _ENDGAME_FENS),
     "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c6 0 2",
     "r1b1k2r/ppppqppp/2n2n2/2b5/4P3/2N2N2/PPPP1PPP/R1BQK2R w KQkq - 6 6",
     "7k/8/8/8/8/8/8/5B1K w - - 0 1",       # KB vs K: insufficient material -> 0
@@ -334,6 +344,18 @@ def test_mopup_jit_matches_reference(fen: str) -> None:
     black_king = board.king(chess.BLACK)
     assert white_king is not None and black_king is not None
     assert evaluate._mopup_jit(occ, pieces, white_king, black_king) == evaluate._mopup(board)
+
+
+@pytest.mark.parametrize("fen", _ENDGAME_FENS + _KX_FENS)
+def test_king_activity_jit_matches_reference(fen: str) -> None:
+    board = chess.Board(fen)
+    pieces, occ, _turn = evaluate._encode(board)
+    white_king = board.king(chess.WHITE)
+    black_king = board.king(chess.BLACK)
+    assert white_king is not None and black_king is not None
+    assert evaluate._king_activity_jit(occ, pieces, white_king, black_king) == (
+        evaluate._king_activity(board)
+    )
 
 
 @pytest.mark.parametrize("fen", _EQUIV_FENS)
