@@ -204,8 +204,8 @@ MOBILITY_EG = {chess.KNIGHT: 4, chess.BISHOP: 5, chess.ROOK: 3, chess.QUEEN: 2}
 # KX-vs-K mate driver (centipawns). Only active when one side is a bare king: push the
 # lone king off the centre toward a corner, and march the winning king up to support the
 # mate. Small vs the material lead -- a gradient to convert by, not a material term.
-MOPUP_CENTER_WEIGHT = 10  # per unit of the lone king's centre-manhattan distance (0..6)
-MOPUP_KINGS_WEIGHT = 4  # per unit the winning king is closer than 7 (Chebyshev)
+MOPUP_CENTER_WEIGHT = 16  # per unit of the lone king's centre-manhattan distance (0..6)
+MOPUP_KINGS_WEIGHT = 8  # per unit the winning king is closer than 7 (Chebyshev)
 
 # Endgame king activity (centipawns). Once material is low and one side is clearly ahead,
 # reward the leading side for marching its king toward the enemy king to help finish --
