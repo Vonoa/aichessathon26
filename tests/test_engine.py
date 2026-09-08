@@ -10,6 +10,7 @@ import pytest
 
 import agent
 import evaluate
+import movegen
 import search
 
 
@@ -68,14 +69,27 @@ def test_is_deterministic() -> None:
     assert first == second
 
 
+def _negamax_fen(fen: str, depth: int, ply: int) -> int:
+    board = chess.Board(fen)
+    bb, state = movegen.encode(board)
+    search._PATH[:4] = 0
+    return search._negamax(bb, state, depth, ply, -search.MATE, search.MATE, time.monotonic() + 5)
+
+
+def _qsearch_fen(fen: str, ply: int, qply: int = 0) -> int:
+    bb, state = movegen.encode(chess.Board(fen))
+    lo, hi = -search.MATE - 1, search.MATE + 1
+    return search._qsearch(bb, state, ply, lo, hi, time.monotonic() + 5, qply)
+
+
 def test_seen_position_is_a_draw_at_the_horizon() -> None:
-    # Regression (Phase 3b): a position already seen in the game must score as a draw even
-    # at depth 0, not be evaluated by material. With contempt (5f) a draw is not exactly 0.
+    # A position already seen in the game must score as a draw even at the horizon, not
+    # be evaluated by material. With contempt a draw is not exactly 0.
     board = chess.Board("8/8/8/4k3/8/8/3RK3/8 w - - 10 40")  # white is up a whole rook
-    search._seen = frozenset({board._transposition_key()})
+    search._seen = frozenset({movegen.zobrist(board)})
     try:
-        even = search._negamax(board, 0, 0, -search.MATE, search.MATE, time.monotonic() + 5)
-        odd = search._negamax(board, 0, 1, -search.MATE, search.MATE, time.monotonic() + 5)
+        even = _negamax_fen(board.fen(), 0, 0)
+        odd = _negamax_fen(board.fen(), 0, 1)
     finally:
         search._seen = frozenset()
     assert even == -search._CONTEMPT
@@ -85,31 +99,27 @@ def test_seen_position_is_a_draw_at_the_horizon() -> None:
 def test_qsearch_resolves_a_hanging_piece() -> None:
     # White's rook can take Black's undefended rook. Static eval sees material equal;
     # quiescence must see the win.
-    board = chess.Board("4k3/8/8/8/8/3r4/3R4/4K3 w - - 0 1")
-    q = search._qsearch(board, 0, -search.MATE, search.MATE, time.monotonic() + 5)
+    fen = "4k3/8/8/8/8/3r4/3R4/4K3 w - - 0 1"
+    q = _qsearch_fen(fen, 0)
     assert q >= 450
-    assert q > evaluate.evaluate(board)
+    assert q > evaluate.evaluate(chess.Board(fen))
 
 
 def test_qsearch_leaves_a_quiet_position_at_the_static_eval() -> None:
-    board = chess.Board("4k3/8/8/8/4P3/8/8/4K3 w - - 0 1")  # nothing to capture, no check
-    q = search._qsearch(board, 0, -search.MATE, search.MATE, time.monotonic() + 5)
-    assert q == evaluate.evaluate(board)
+    fen = "4k3/8/8/8/4P3/8/8/4K3 w - - 0 1"  # nothing to capture, no check
+    assert _qsearch_fen(fen, 0) == evaluate.evaluate(chess.Board(fen))
 
 
 def test_qsearch_follows_a_quiet_check_to_win_material() -> None:
-    # White is down a queen for a knight, but Nf4+ forks the king and the queen. There is
-    # no capture in the position, so a captures-only quiescence just stands pat here;
-    # following one ply of quiet checks finds the fork and swings the score back.
-    board = chess.Board("r7/8/4k1q1/8/8/3N4/6PP/1R4K1 w - - 0 1")
-    deadline = time.monotonic() + 5
-    stand_pat = evaluate.evaluate(board)
-    q = search._qsearch(board, 1, -search.MATE - 1, search.MATE + 1, deadline)
-    assert stand_pat < -300  # really is down material before the tactic
-    assert q > stand_pat + 400  # the quiet check is searched and the fork is found
+    # White is down a queen for a knight, but Nf4+ forks the king and the queen. No
+    # capture in the position, so a captures-only quiescence just stands pat; following
+    # one ply of quiet checks finds the fork and swings the score back.
+    fen = "r7/8/4k1q1/8/8/3N4/6PP/1R4K1 w - - 0 1"
+    stand_pat = evaluate.evaluate(chess.Board(fen))
+    assert stand_pat < -300
+    assert _qsearch_fen(fen, 1) > stand_pat + 400
     # With the check window exhausted (qply past _QS_CHECK_PLIES) it reverts to stand-pat.
-    no_checks = search._qsearch(board, 1, -search.MATE - 1, search.MATE + 1, deadline, 9)
-    assert no_checks == stand_pat
+    assert _qsearch_fen(fen, 1, 9) == stand_pat
 
 
 def test_tt_entry_round_trips() -> None:
@@ -142,19 +152,20 @@ def test_tt_persists_across_moves_and_cuts_nodes() -> None:
     # nodes. The move can differ between equal-scored choices, so don't assert on it.
     board = chess.Board("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3")
     far = time.monotonic() + 120
-    first_move = next(iter(board.legal_moves))
-    search._killers[:] = [None] * search._KILLER_SLOTS
+    search._killers[:] = [0] * search._KILLER_SLOTS
     search._hist[:] = [0] * 4096
+    window = (-search.MATE - 1, search.MATE + 1)
 
-    full_window = (-search.MATE - 1, search.MATE + 1)
     search._tt_gen = (search._tt_gen + 1) & 0xFFFF
     search._nodes = 0
-    _, cold_score = search._search_root(board, 4, far, first_move, *full_window)
+    bb, state = movegen.encode(board)
+    _, cold_score = search._search_root(bb, state, 4, far, 0, *window)
     cold_nodes = search._nodes
 
     search._tt_gen = (search._tt_gen + 1) & 0xFFFF
     search._nodes = 0
-    _, warm_score = search._search_root(board, 4, far, first_move, *full_window)
+    bb, state = movegen.encode(board)
+    _, warm_score = search._search_root(bb, state, 4, far, 0, *window)
     warm_nodes = search._nodes
 
     assert warm_score == cold_score
@@ -167,14 +178,12 @@ def test_tt_stores_no_value_it_cannot_encode() -> None:
     # past +-_TT_VALUE_MAX) has to be skipped, never wrapped into the 16-bit field.
     assert search._TT_VALUE_MAX < search._MATE_THRESHOLD  # so mate scores can't be stored
     board = chess.Board("8/6k1/8/8/8/8/1R4K1/8 w - - 0 1")
-    search._killers[:] = [None] * search._KILLER_SLOTS
+    search._killers[:] = [0] * search._KILLER_SLOTS
     search._hist[:] = [0] * 4096
     search._tt_gen = (search._tt_gen + 1) & 0xFFFF
     search._nodes = 0
-    search._search_root(
-        board, 6, time.monotonic() + 120, next(iter(board.legal_moves)),
-        -search.MATE - 1, search.MATE + 1,
-    )
+    bb, state = movegen.encode(board)
+    search._search_root(bb, state, 6, time.monotonic() + 120, 0, -search.MATE - 1, search.MATE + 1)
 
     occupied = search._tt_key != 0
     assert int(occupied.sum()) > 0
@@ -231,19 +240,19 @@ def test_syzygy_converts_a_won_pawn_ending() -> None:
 
 
 def test_cutoff_updates_killers_and_history() -> None:
-    move = chess.Move.from_uci("e2e4")
+    code = chess.E2 | (chess.E4 << 6)  # move code for e2e4 (from | to << 6)
     base = 3 * 2
-    search._killers[base] = None
-    search._killers[base + 1] = None
-    idx = move.from_square * 64 + move.to_square
+    search._killers[base] = 0
+    search._killers[base + 1] = 0
+    idx = chess.E2 * 64 + chess.E4
     before = search._hist[idx]
     try:
-        search._record_cutoff(move, ply=3, depth=5)
-        assert search._killers[base] == move
+        search._record_cutoff(code, ply=3, depth=5)
+        assert search._killers[base] == code
         assert search._hist[idx] == before + 25
     finally:
-        search._killers[base] = None
-        search._killers[base + 1] = None
+        search._killers[base] = 0
+        search._killers[base + 1] = 0
         search._hist[idx] = before
 
 

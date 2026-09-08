@@ -2,25 +2,26 @@
 
 import time
 import traceback
-from collections.abc import Hashable
 
 import chess
 
-from search import search_move
+import movegen
+import search
 
 # Bump this on every upload. It prints once at import, so the per-game log the platform
 # keeps names exactly which build played that game.
-BUILD = "diag-8 persistent-TT + PVS/aspiration + syzygy 3-man"
+BUILD = "diag-9 jitted movegen (B2)"
 print(f"agent build: {BUILD}", flush=True)
 
 # Import time runs once per game, inside a 90 second budget, before your clock starts.
-# Load weights and build tables out here, not inside get_move. Warm every numba-jitted
-# function here too, so compilation lands in the init budget rather than on the clock.
+# Warm the jitted search path here so numba compiles it inside that budget, not on the
+# clock during the first move.
+search.warm_up()
 
-# Every position we have been asked to move in this game, counted. The process is fresh
-# per game so this resets on its own. The search reads it to spot a line that repeats a
-# position the game has already seen and score it as a draw.
-_history: dict[Hashable, int] = {}
+# Every position we have been asked to move in this game, keyed by its Zobrist hash. The
+# process is fresh per game so this resets on its own. The search reads it to spot a line
+# that repeats a position the game has already seen and score it as a draw.
+_history: dict[int, int] = {}
 
 # Last move's clock and our own measured spend, used to infer the increment (get_move is
 # not told it). new_clock == old_clock - our_spend + increment, so increment falls out.
@@ -40,13 +41,13 @@ def get_move(fen: str, time_left_ms: int) -> str:
     print() is safe: stdout is redirected away from the protocol stream.
     """
     board = chess.Board(fen)
-    key = board._transposition_key()
+    key = movegen.zobrist(board)
     _history[key] = _history.get(key, 0) + 1
 
     increment_ms = _infer_increment(time_left_ms)
     started = time.monotonic()
     try:
-        return search_move(board, time_left_ms, _history, increment_ms)
+        return search.search_move(board, time_left_ms, _history, increment_ms)
     except Exception as exc:
         # A bug in the search must never forfeit the game: fall back to any legal move.
         # Print the failure so a rated game that hits this path can be diagnosed -- the

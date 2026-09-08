@@ -381,3 +381,58 @@ board is down to `_TB_MAX_PIECES` (5) men or fewer and the files are present,
   engine silently falls back to search.
 - Gate + arena vs `versions/phase5jit` pending. `make gate` skips the syzygy tests if
   `search._tablebase is None`.
+
+### 2026-09-08 -- Jitted move generator, Phase A (branch `jit-movegen`)
+
+`movegen.py`: a numba-jitted bitboard generator, built and validated on its own before
+it touches `search.py` (docs/PLAN.md Phase 3 -- "the hardest phase"; a movegen bug is a
+lost game).
+
+- Representation: `bb` uint64[2,6] (same layout as `evaluate._encode`) + `state` int64[4]
+  `[turn, castling, ep, halfmove]`. Moves packed into int32 (`from | to<<6 | promo<<12 |
+  flag<<15`, flag = normal / double-push / en-passant / castle).
+- Jitted: `_gen` (pseudo-legal), `_make` / `_unmake` (in place, undo word), `_attacked_by`
+  (occupancy-parametrised), `_gen_legal` (gen + king-safety filter), `_perft`.
+- **Validated:** perft matches the published numbers for all six standard positions
+  (initial d5 4,865,609; Kiwipete d4 4,085,603; positions 3-6) *and* python-chess's own
+  counts. The legal-move SET matches python-chess move-for-move over 21,307 positions
+  from 600 pseudo-random games -- zero mismatches (castling, en passant, promotions
+  included).
+- **Speed:** ~4.4-5.2M nps for jitted perft vs python-chess's ~0.26M -- ~17x at the raw
+  gen + make + legality + unmake work.
+- Cost: the numba compile of `_gen` / `_gen_legal` is ~22 s at import (`_perft` is not
+  warmed -- validation only). Fits the 90 s init budget with room; `cache=False` because
+  `/tmp` is wiped per game.
+- Tests: `tests/test_movegen.py` (perft to d3-d4, legal-set divergence, encode round
+  trip). `movegen.py` added to the mypy files list.
+- **Not integrated.** Phase B decides how deep to wire it into the search -- the real
+  win needs the search to carry a lightweight board the whole way down, not push/pop a
+  chess.Board per node.
+
+### 2026-09-08 -- Jitted move generator wired into the search, Phase B (branch `jit-movegen`)
+
+The search now runs on `movegen.py`'s bitboard board: `(bb, state)` numpy arrays,
+`_gen_legal` / `_make` / `_unmake` in place of `board.legal_moves` / `push` / `pop`,
+`_zobrist` for the TT and repetition keys, `_attacked_by` for check detection, and
+`evaluate._evaluate_jit` read straight off `bb`. A `chess.Board` is touched only at the
+root -- parse the FEN, probe Syzygy, format the UCI reply. `agent.py` keys `_history` by
+`movegen.zobrist`.
+
+- **Sub-steps, each validated:** eval bridge == `evaluate.evaluate` over 8,432 positions
+  (0 mismatch); Zobrist transposition-consistent + make/unmake round-trips + deterministic;
+  search score == old python-chess search on **561/562 positions at fixed depth 3**
+  (worst gap 31 cp, the known LMR-fail-soft ordering effect). Move matches 69% -- the
+  rest are equal-value alternatives (the generator's move order differs from
+  python-chess's, so the stable-sort tie-break picks differently).
+- **Speed: ~2.4x nps, +1-2 plies.** Bench: open middlegame d3->d4 (~22k->49k nps),
+  sharp middlegame d3->d5 (~25k->60k), rook endgame d7->d8 (~30k->74k). Base node cost
+  ~40 us -> ~15 us.
+- `search.warm_up()` runs one tiny search at import so numba compiles the whole path in
+  the ~14 s import, not on move one. First real move: d3 in 188 ms, no compile stall.
+- `_insufficient` is a coarse jitted check (KvK, K+minor vs K); same-colour KBvKB and
+  KNNvK fall through to the eval / repetition -- rare, never a blunder.
+- Tests: the six search-internal tests rewritten to the `(bb, state)` interface; gate
+  green (245 pass, 1 xfail).
+- **Still open:** SEE / NMP un-parked on the fast substrate (both should flip positive
+  now); a full arena vs `versions/phase5jit` + `make zip` smoke before any upload;
+  `docs/ENGINE.md` / `PLAN.md` describe the old python-chess search and need a rewrite.

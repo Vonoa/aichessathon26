@@ -1,42 +1,32 @@
 """Negamax with alpha-beta, iterative deepening, a transposition table, and a time budget.
 
-Phase 3b adds the transposition table: a search result is cached by position, so a
-position reached by a different move order is not re-searched, and the best move from the
-last iteration is tried first on the next. The table is cleared each move for now; Phase 4
-makes it persistent and fixed-size and adds the rest of the pruning stack. Phase 3e
-replaces the python-chess move loop with a jitted generator.
+The search runs on the jitted bitboard board from movegen.py: `(bb, state)` numpy arrays,
+`movegen._gen_legal` / `_make` / `_unmake` in place of `board.legal_moves` / `push` / pop,
+and `movegen._zobrist` for the transposition and repetition keys. A `chess.Board` is only
+touched at the root -- to parse the FEN, probe Syzygy, and format the UCI reply.
 
-Phase 4a adds quiescence search: at the horizon, keep searching captures (and check
-evasions) until the position is quiet before calling evaluate(), so the score is never
-read in the middle of an exchange. It also follows one ply of quiet checks past the
-horizon, so a forcing shot (knight fork with check, back-rank skewer) is not missed.
+Phase 4a: quiescence search -- at the horizon keep searching captures, promotions and one
+ply of quiet checks until the position is quiet, so the eval is never read mid-exchange.
+Phase 4b: killer moves + a history heuristic order the quiet moves, reset each move.
+Phase 5f: contempt -- every draw path scores _CONTEMPT below equal from the root side.
+Check extension: a node in check is searched one ply deeper. Late-move reductions: quiet
+moves ordered late are scouted shallower first. Principal variation search + aspiration
+windows narrow the search around the previous iteration's score.
 
-Phase 4b adds killer moves and a history heuristic: a quiet move that caused a beta
-cutoff is tried early in sibling nodes (killer, per ply) and its from/to square pair
-accrues a score that ranks the remaining quiet moves. Both reset each move.
-
-Phase 5f adds contempt: every draw path scores _CONTEMPT below equal from the root side's
-point of view, so the engine only accepts a draw when it genuinely believes it is worse.
-
-Check extension: a node that is in check is searched one ply deeper, so a forcing line
-resolves before it is evaluated. Late-move reductions: quiet moves ordered late are
-searched shallower first and only re-searched at full depth if they beat alpha.
-
-The engine is deterministic by construction: no RNG is imported, move ordering is a
-stable sort over python-chess's fixed generation order, and ties are broken by first-seen.
-The same position and clock always produce the same move.
+Deterministic by construction: no RNG in the search, move ordering is a stable sort over
+the generator's fixed order, ties broken by first-seen. Same position + clock -> same move.
 """
 
 import os
 import time
-from collections.abc import Hashable
 
 import chess
 import chess.syzygy
 import numpy as np
 import numpy.typing as npt
 
-from evaluate import evaluate
+import movegen
+from evaluate import _evaluate_jit
 
 MATE = 1_000_000
 _MATE_THRESHOLD = MATE - 1_000  # a score past this is a forced mate
@@ -47,6 +37,7 @@ _MAX_DEPTH = 64
 _QS_MAX_PLY = _MAX_DEPTH + 32  # hard cap on quiescence recursion, a safety net
 _QS_CHECK_PLIES = 1  # follow non-capturing checks this many plies past the horizon
 _QS_CHECK_CAP = 6  # at most this many quiet checking moves added per quiescence node
+_MAX_PLY = _MAX_DEPTH + _QS_MAX_PLY + 16  # size of the per-ply scratch buffers
 
 _EXACT, _LOWER, _UPPER = 0, 1, 2  # transposition-table bound kinds
 _LMR_MIN_DEPTH = 3  # only reduce late moves with this much depth left
@@ -70,7 +61,8 @@ except Exception as _tb_exc:  # a tablebase must never break import
     _tablebase = None
 
 # Move-ordering score bands: captures and promotions on top, then the two killer slots
-# for this ply, then quiet moves ranked by the history heuristic (well below these).
+# for this ply, then quiet moves ranked by the history heuristic (well below these). A
+# transposition-table move is spliced to the very front after the sort.
 _CAPTURE_BASE = 10_000_000
 _KILLER_0 = 9_000_000
 _KILLER_1 = 8_000_000
@@ -80,9 +72,15 @@ _DEBUG = os.environ.get("AGENT_DEBUG") == "1"
 
 _nodes = 0
 _last_depth = 0  # deepest fully completed pass of the last search; read by tools/bench.py
-_seen: frozenset[Hashable] = frozenset()
-_killers: list[chess.Move | None] = [None] * _KILLER_SLOTS  # two per ply, flat: ply*2, ply*2+1
+_seen: frozenset[int] = frozenset()  # zobrist keys of positions already seen this game
+_killers: list[int] = [0] * _KILLER_SLOTS  # two move codes per ply, flat: ply*2, ply*2+1
 _hist: list[int] = [0] * 4096  # quiet-move cutoff counts, indexed from_square*64 + to_square
+
+# Per-ply scratch: one legal-move buffer per recursion level, one occupancy triple, and
+# the chain of position keys down the current line (for repetition detection).
+_MBUF: npt.NDArray[np.int32] = np.empty((_MAX_PLY, 256), dtype=np.int32)
+_OCC3: npt.NDArray[np.uint64] = np.empty(3, dtype=np.uint64)
+_PATH: npt.NDArray[np.uint64] = np.zeros(_MAX_PLY, dtype=np.uint64)  # zobrist keys, full 64-bit
 
 # Transposition table. Fixed-size and kept across moves within a game -- a fresh process
 # per game resets it for free; tests call _reset_tt(). Two flat uint64 arrays, no
@@ -92,9 +90,9 @@ _TT_BITS = 22
 _TT_SIZE = 1 << _TT_BITS  # 4,194,304 slots; 64 MB for the pair of arrays
 _TT_MASK = _TT_SIZE - 1
 _TT_VALUE_MAX = 30_000  # values outside +-this are not stored: they cannot fit the 16-bit
-#                         field and a real evaluate() score never comes near it anyway.
-#                         This also excludes mate scores (measured from the root, wrong
-#                         down another path) without a separate check.
+#                         field and a real eval score never comes near it anyway. This
+#                         also excludes mate scores (measured from the root, wrong down
+#                         another path) without a separate check.
 _tt_key: npt.NDArray[np.uint64] = np.zeros(_TT_SIZE, dtype=np.uint64)  # 0 == empty slot
 _tt_data: npt.NDArray[np.uint64] = np.zeros(_TT_SIZE, dtype=np.uint64)
 _tt_gen = 0  # bumped per search; a slot from an older generation is always replaceable
@@ -103,7 +101,7 @@ _tt_gen = 0  # bumped per search; a slot from an older generation is always repl
 #   bits  0-15  value, offset-encoded (value + 0x8000) so negatives round-trip
 #   bits 16-23  depth (0..255; mate scores are never stored, so 16 bits of value is plenty)
 #   bits 24-25  bound flag (_EXACT / _LOWER / _UPPER)
-#   bits 26-41  best-move code: from | to << 6 | promo << 12  (0 == no move)
+#   bits 26-40  best-move code: from | to << 6 | promo << 12  (0 == no move)
 #   bits 42-57  generation, low 16 bits
 _PROMO_CODE = {None: 0, chess.KNIGHT: 1, chess.BISHOP: 2, chess.ROOK: 3, chess.QUEEN: 4}
 _CODE_PROMO: tuple[int | None, ...] = (None, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN)
@@ -136,28 +134,60 @@ class _Timeout(Exception):
     """Raised inside the search when the per-move budget is spent."""
 
 
+# --- board-state helpers on (bb, state) --------------------------------------------
+
+
+def _eval_bb(bb: npt.NDArray[np.uint64], state: npt.NDArray[np.int64]) -> int:
+    """Static eval from the side-to-move's point of view -- the jitted eval read straight
+    off the bitboard board (validated identical to evaluate.evaluate)."""
+    movegen._occ3(bb, _OCC3)
+    wk = movegen._king_sq(bb, 0)
+    bk = movegen._king_sq(bb, 1)
+    return int(_evaluate_jit(bb, _OCC3, wk, bk, int(state[0]) == 0))
+
+
+def _in_check(bb: npt.NDArray[np.uint64], state: npt.NDArray[np.int64]) -> bool:
+    turn = int(state[0])
+    movegen._occ3(bb, _OCC3)
+    return movegen._attacked_by(bb, _OCC3[2], movegen._king_sq(bb, turn), 1 - turn)
+
+
+def _insufficient(bb: npt.NDArray[np.uint64]) -> bool:
+    """K vs K, K+minor vs K -- the common insufficient-material draws. Same-colour KBvKB
+    and KNNvK are left to the eval / repetition (rare, never a blunder)."""
+    if int(bb[0, 0] | bb[1, 0] | bb[0, 3] | bb[1, 3] | bb[0, 4] | bb[1, 4]):
+        return False
+    minors = int(bb[0, 1] | bb[1, 1] | bb[0, 2] | bb[1, 2])
+    return minors == (minors & -minors)  # zero or one bit set
+
+
+def _repeats(key: int, ply: int) -> bool:
+    """Has this exact key already appeared higher in the current line?"""
+    return any(int(_PATH[j]) == key for j in range(ply))
+
+
+# --- iterative deepening at the root ---------------------------------------------
+
+
 def search_move(
     board: chess.Board,
     time_left_ms: int,
-    history: dict[Hashable, int] | None = None,
+    history: dict[int, int] | None = None,
     increment_ms: float = 0.0,
 ) -> str:
     """Search the position and return the best move found, in UCI notation.
 
     Iterative deepening: each pass keeps the best move from the last *completed* depth,
-    so whenever the budget runs out there is always a finished answer to return, and that
-    move is tried first on the next, deeper pass.
+    so whenever the budget runs out there is always a finished answer to return.
     """
     global _nodes, _seen, _last_depth, _tt_gen
     _nodes = 0
     _last_depth = 0
-    _seen = frozenset(history) if history else frozenset()
+    _seen = frozenset(int(k) for k in history) if history else frozenset()
     _tt_gen = (_tt_gen + 1) & 0xFFFF  # keep the table; mark this search's entries fresh
-    _killers[:] = [None] * _KILLER_SLOTS
+    _killers[:] = [0] * _KILLER_SLOTS
     _hist[:] = [0] * 4096
 
-    # Capture the move label now: an interrupted search unwinds through _Timeout without
-    # popping, so board.fullmove_number / board.turn are unreliable once the loop ends.
     label = f"{board.fullmove_number}{'w' if board.turn else 'b'}"
 
     legal = list(board.legal_moves)
@@ -172,25 +202,28 @@ def search_move(
         _log_move(label, chess.Move.from_uci(tb_move), 0, 0, time_left_ms, time.monotonic())
         return tb_move
 
+    bb0, state0 = movegen.encode(board)
+    turn = int(state0[0])
+    enemy_occ = int(movegen._occ_of(bb0, 1 - turn))
+    n = movegen._gen_legal(bb0, state0, _MBUF[0])
     started = time.monotonic()
     deadline = started + _budget_s(board, time_left_ms, increment_ms)
-    # Ordered so that an interrupted first pass (severe time pressure) still returns the
-    # best-looking move rather than whatever python-chess happened to generate first.
-    best = _ordered(board, legal)[0]
+    # Ordered so an interrupted first pass still returns the best-looking move.
+    best_code = int(_ordered(bb0, turn, enemy_occ, _MBUF[0][:n].tolist(), -1, 0)[0])
     score = 0
     for depth in range(1, _MAX_DEPTH + 1):
-        # Aspiration: past the shallow passes, search a narrow window around the last
-        # score. A hit gives more cutoffs (deeper reach); a miss widens and re-searches,
-        # which the persistent TT makes cheap.
+        # Aspiration: past the shallow passes, a narrow window around the last score.
         if depth <= 3:
             alpha, beta = -MATE - 1, MATE + 1
         else:
             alpha, beta = score - _ASPIRATION, score + _ASPIRATION
         try:
-            move, score = _aspiration_search(board, depth, deadline, best, alpha, beta)
+            move_code, score = _aspiration_search(
+                bb0, state0, depth, deadline, best_code, alpha, beta
+            )
         except _Timeout:
             break
-        best = move
+        best_code = move_code
         _last_depth = depth
         if _DEBUG:
             elapsed = (time.monotonic() - started) * 1000.0
@@ -199,120 +232,115 @@ def search_move(
             break  # forced mate found; a deeper search cannot improve on it
         if time.monotonic() >= deadline:
             break
-    _log_move(label, best, score, _last_depth, time_left_ms, started)
-    return best.uci()
-
-
-def _log_move(
-    label: str, move: chess.Move, score: int, depth: int, clock_ms: int, started: float
-) -> None:
-    """One compact line per move to stderr, kept in the platform's per-game log so a rated
-    game can be diagnosed after the fact (real depth reached, nodes, time actually spent).
-    """
-    ms = (time.monotonic() - started) * 1000.0
-    print(
-        f"[{label}] {move.uci()} d{depth} score {score:+d} nodes {_nodes} "
-        f"{ms:.0f}ms clock {clock_ms}",
-        flush=True,
-    )
-
-
-def _budget_s(board: chess.Board, time_left_ms: int, increment_ms: float) -> float:
-    """Time to spend on this move, in seconds.
-
-    A sustainable share of the clock plus half the increment (each move refills the clock
-    by the increment, so it is time to spend, not hoard). Assume the game still has a fair
-    number of moves left - never divide by fewer than 30 - then never commit more than a
-    third of the clock to one move and always leave a reserve. Floored at 10 ms.
-    """
-    moves_left = max(30, 56 - board.fullmove_number)
-    budget_ms = time_left_ms / moves_left + 0.5 * increment_ms
-    budget_ms = min(budget_ms, time_left_ms / 3.0, float(time_left_ms - _RESERVE_MS))
-    return max(budget_ms, 10.0) / 1000.0
+    best_move = movegen.decode_move(best_code)
+    _log_move(label, best_move, score, _last_depth, time_left_ms, started)
+    return best_move.uci()
 
 
 def _aspiration_search(
-    board: chess.Board, depth: int, deadline: float, first: chess.Move, alpha: int, beta: int
-) -> tuple[chess.Move, int]:
-    """Run _search_root, and if the result falls outside (alpha, beta) widen that side to
-    infinity and try once more. At most one re-search per side, so two searches worst case.
-    """
+    bb0: npt.NDArray[np.uint64],
+    state0: npt.NDArray[np.int64],
+    depth: int,
+    deadline: float,
+    first_code: int,
+    alpha: int,
+    beta: int,
+) -> tuple[int, int]:
+    """Run _search_root on a fresh copy of the root state; if the result falls outside
+    (alpha, beta) widen that side to infinity and try once more."""
     while True:
-        move, score = _search_root(board, depth, deadline, first, alpha, beta)
+        bb = bb0.copy()
+        state = state0.copy()
+        move_code, score = _search_root(bb, state, depth, deadline, first_code, alpha, beta)
         if score <= alpha and alpha > -MATE - 1:
             alpha = -MATE - 1
         elif score >= beta and beta < MATE + 1:
             beta = MATE + 1
         else:
-            return move, score
+            return move_code, score
 
 
 def _search_root(
-    board: chess.Board, depth: int, deadline: float, first: chess.Move, alpha: int, beta: int
-) -> tuple[chess.Move, int]:
-    moves = _ordered(board, list(board.legal_moves))
-    if first in moves:
-        moves.remove(first)
-        moves.insert(0, first)
+    bb: npt.NDArray[np.uint64],
+    state: npt.NDArray[np.int64],
+    depth: int,
+    deadline: float,
+    first_code: int,
+    alpha: int,
+    beta: int,
+) -> tuple[int, int]:
+    _PATH[0] = int(movegen._zobrist(bb, state))
+    turn = int(state[0])
+    enemy_occ = int(movegen._occ_of(bb, 1 - turn))
+    n = movegen._gen_legal(bb, state, _MBUF[0])
+    first_core = (first_code & 0x7FFF) if first_code else 0
+    ordered = _ordered(bb, turn, enemy_occ, _MBUF[0][:n].tolist(), -1, first_core)
 
-    best_move = moves[0]
+    best_code = int(ordered[0])
     best_score = -MATE - 1
-    for i, move in enumerate(moves):
-        board.push(move)
+    for i, raw in enumerate(ordered):
+        code = int(raw)
+        undo = movegen._make(bb, state, code)
         if i == 0:
-            score = -_negamax(board, depth - 1, 1, -beta, -alpha, deadline)
+            move_score = -_negamax(bb, state, depth - 1, 1, -beta, -alpha, deadline)
         else:
-            # Scout with a null window; only re-search in full if it beats alpha.
-            score = -_negamax(board, depth - 1, 1, -alpha - 1, -alpha, deadline)
-            if alpha < score < beta:
-                score = -_negamax(board, depth - 1, 1, -beta, -alpha, deadline)
-        board.pop()
-        if score > best_score:
-            best_score = score
-            best_move = move
-        if score > alpha:
-            alpha = score
+            move_score = -_negamax(bb, state, depth - 1, 1, -alpha - 1, -alpha, deadline)
+            if alpha < move_score < beta:
+                move_score = -_negamax(bb, state, depth - 1, 1, -beta, -alpha, deadline)
+        movegen._unmake(bb, state, code, undo)
+        if move_score > best_score:
+            best_score = move_score
+            best_code = code
+        if move_score > alpha:
+            alpha = move_score
         if alpha >= beta:
             break  # fail-high at the root; _aspiration_search widens and re-searches
-    return best_move, best_score
+    return best_code, best_score
 
 
 def _negamax(
-    board: chess.Board, depth: int, ply: int, alpha: int, beta: int, deadline: float
+    bb: npt.NDArray[np.uint64],
+    state: npt.NDArray[np.int64],
+    depth: int,
+    ply: int,
+    alpha: int,
+    beta: int,
+    deadline: float,
 ) -> int:
     _tick(deadline)
-    in_check = board.is_check()
+    if ply >= _MAX_PLY - 1:
+        return _eval_bb(bb, state)
+
+    turn = int(state[0])
+    movegen._occ3(bb, _OCC3)
+    in_check = movegen._attacked_by(bb, _OCC3[2], movegen._king_sq(bb, turn), 1 - turn)
     if in_check and ply < _MAX_DEPTH:
         depth += 1  # check extension: let a forcing line resolve before we evaluate it
 
-    if board.is_fifty_moves():
+    if int(state[3]) >= 100:
         return _draw_score(ply)
-    if chess.popcount(board.occupied) <= 4 and board.is_insufficient_material():
+    if int(_OCC3[2]).bit_count() <= 4 and _insufficient(bb):
         return _draw_score(ply)
 
-    moves = list(board.legal_moves)
-    if not moves:
+    n = movegen._gen_legal(bb, state, _MBUF[ply])
+    if n == 0:
         return -MATE + ply if in_check else _draw_score(ply)
 
-    # A repetition or an already-seen position is a draw even when it lands exactly on the
-    # horizon, so this must run before the depth<=0 leaf return. The key is only computed
-    # once halfmove_clock makes a repetition possible, so quiet leaves still skip it.
-    tkey = board._transposition_key() if board.halfmove_clock >= 4 else None
-    if tkey is not None and (board.is_repetition(2) or tkey in _seen):
+    key = int(movegen._zobrist(bb, state))
+    if int(state[3]) >= 4 and (key in _seen or _repeats(key, ply)):
         return _draw_score(ply)
+    _PATH[ply] = key
     if depth <= 0:
-        return _qsearch(board, ply, alpha, beta, deadline)
+        return _qsearch(bb, state, ply, alpha, beta, deadline, 0)
 
-    if tkey is None:
-        tkey = board._transposition_key()
-    key64 = hash(tkey) & 0xFFFFFFFFFFFFFFFF or 1  # 0 is the empty-slot marker
+    key64 = key or 1  # 0 is the empty-slot marker
     slot = key64 & _TT_MASK
-    tt_move: chess.Move | None = None
+    tt_move = 0
     if int(_tt_key[slot]) == key64:
         data = int(_tt_data[slot])
         e_depth = (data >> 16) & 0xFF
         e_flag = (data >> 24) & 0x3
-        tt_move = _code_move((data >> 26) & 0xFFFF)
+        tt_move = (data >> 26) & 0x7FFF
         if e_depth >= depth:
             e_value = (data & 0xFFFF) - 0x8000
             if e_flag == _EXACT:
@@ -322,62 +350,55 @@ def _negamax(
             if e_flag == _UPPER and e_value <= alpha:
                 return e_value
 
-    ordered = _ordered(board, moves, ply)
-    if tt_move is not None and tt_move in ordered:
-        ordered.remove(tt_move)
-        ordered.insert(0, tt_move)
+    enemy_occ = int(movegen._occ_of(bb, 1 - turn))
+    ordered = _ordered(bb, turn, enemy_occ, _MBUF[ply][:n].tolist(), ply, tt_move)
 
     alpha_orig = alpha
     value = -MATE - 1
-    best_move: chess.Move | None = None
-    for move_index, move in enumerate(ordered):
-        quiet = move.promotion is None and not board.is_capture(move)
-        board.push(move)
+    best_code = 0
+    for move_index, raw in enumerate(ordered):
+        code = int(raw)
+        to = (code >> 6) & 0x3F
+        flag = (code >> 15) & 7
+        is_cap = flag == 2 or ((enemy_occ >> to) & 1)
+        quiet = ((code >> 12) & 7) == 0 and not is_cap
+        undo = movegen._make(bb, state, code)
 
         if move_index == 0:
             # The principal variation: search it in full to establish a real bound.
-            score = -_negamax(board, depth - 1, ply + 1, -beta, -alpha, deadline)
+            score = -_negamax(bb, state, depth - 1, ply + 1, -beta, -alpha, deadline)
         else:
-            # Late-move reduction: quiet moves ordered late are probably bad, so scout
-            # them shallower. Every non-PV move is scouted with a null window; if the
-            # scout beats alpha (or a reduced scout does), re-search it in full.
+            gives_check = _in_check(bb, state)  # opponent now to move
             reduce = (
                 quiet
                 and not in_check
                 and depth >= _LMR_MIN_DEPTH
                 and move_index >= _LMR_MIN_MOVE
-                and not board.is_check()
+                and not gives_check
             )
             r = (2 if move_index >= _LMR_MIN_MOVE + 3 else 1) if reduce else 0
-            score = -_negamax(board, depth - 1 - r, ply + 1, -alpha - 1, -alpha, deadline)
+            score = -_negamax(bb, state, depth - 1 - r, ply + 1, -alpha - 1, -alpha, deadline)
             if score > alpha and (r > 0 or score < beta):
-                score = -_negamax(board, depth - 1, ply + 1, -beta, -alpha, deadline)
+                score = -_negamax(bb, state, depth - 1, ply + 1, -beta, -alpha, deadline)
 
-        board.pop()
+        movegen._unmake(bb, state, code, undo)
         if score > value:
             value = score
-            best_move = move
+            best_code = code
         alpha = max(alpha, value)
         if alpha >= beta:
             if quiet:
-                _record_cutoff(move, ply, depth)
+                _record_cutoff(code, ply, depth)
             break
 
-    # Mate scores are not stored (see _TT_VALUE_MAX): measured from the root, they are
-    # wrong down a different path. A 0 from an in-search repetition is mildly
-    # path-dependent too, but the generation stamp below refreshes such entries within a
-    # move or two and contempt keeps the error to +-_CONTEMPT -- a standard trade-off for
-    # a persistent table.
     if abs(value) < _TT_VALUE_MAX:
         if value <= alpha_orig:
-            flag = _UPPER
+            flag_out = _UPPER
         elif value >= beta:
-            flag = _LOWER
+            flag_out = _LOWER
         else:
-            flag = _EXACT
+            flag_out = _EXACT
         prev = int(_tt_data[slot])
-        # Replace unless the slot already holds a deeper result for THIS position from
-        # THIS search; a stale-generation or different-position slot is always taken.
         if (
             int(_tt_key[slot]) != key64
             or ((prev >> 42) & 0xFFFF) != _tt_gen
@@ -387,57 +408,73 @@ def _negamax(
             _tt_data[slot] = (
                 ((value + 0x8000) & 0xFFFF)
                 | (min(depth, 255) << 16)
-                | (flag << 24)
-                | (_move_code(best_move) << 26)
+                | (flag_out << 24)
+                | ((best_code & 0x7FFF) << 26)
                 | ((_tt_gen & 0xFFFF) << 42)
             )
     return value
 
 
 def _qsearch(
-    board: chess.Board, ply: int, alpha: int, beta: int, deadline: float, qply: int = 0
+    bb: npt.NDArray[np.uint64],
+    state: npt.NDArray[np.int64],
+    ply: int,
+    alpha: int,
+    beta: int,
+    deadline: float,
+    qply: int = 0,
 ) -> int:
     """Search captures, promotions, and - for the first _QS_CHECK_PLIES plies past the
     horizon - quiet checks, until the position is quiet. All evasions when in check.
 
-    Without this the evaluation is read mid-exchange - "up a queen" one ply before the
-    recapture - and is wrong. The stand-pat score assumes the side to move can hold at
-    least the static eval, which fails only in zugzwang and is a standard trade-off.
-
-    Following one ply of quiet checks catches the forcing shot - a knight fork with check,
-    a back-rank skewer - that a captures-only qsearch walks past. It can only raise the
-    score (a bad check just scores low and is ignored), so stand-pat stays sound; qply
-    gates the extra generation only, not the recursion depth.
+    Without this the eval is read mid-exchange and is wrong. The stand-pat score assumes
+    the side to move can hold at least the static eval (fails only in zugzwang). Following
+    one ply of quiet checks catches a forcing shot a captures-only qsearch walks past --
+    it can only raise the score, so stand-pat stays sound.
     """
     _tick(deadline)
-    if ply >= _QS_MAX_PLY:
-        return evaluate(board)
+    if ply >= _MAX_PLY - 1 or ply >= _QS_MAX_PLY:
+        return _eval_bb(bb, state)
 
-    if board.is_check():
-        moves = list(board.legal_moves)
-        if not moves:
+    turn = int(state[0])
+    in_check = _in_check(bb, state)
+    n = movegen._gen_legal(bb, state, _MBUF[ply])
+
+    if in_check:
+        if n == 0:
             return -MATE + ply
         best = -MATE - 1
+        enemy_occ = int(movegen._occ_of(bb, 1 - turn))
+        move_list: list[int] = list(_ordered(bb, turn, enemy_occ, _MBUF[ply][:n].tolist(), -1, 0))
     else:
-        best = evaluate(board)
+        best = _eval_bb(bb, state)
         if best >= beta:
             return best
         if best > alpha:
             alpha = best
         want_checks = qply < _QS_CHECK_PLIES
-        captures: list[chess.Move] = []
-        checks: list[chess.Move] = []
-        for m in board.legal_moves:
-            if board.is_capture(m) or m.promotion is not None:
-                captures.append(m)
-            elif want_checks and len(checks) < _QS_CHECK_CAP and board.gives_check(m):
-                checks.append(m)
-        moves = captures + checks
+        enemy_occ = int(movegen._occ_of(bb, 1 - turn))
+        captures: list[int] = []
+        checks: list[int] = []
+        for i in range(n):
+            code = int(_MBUF[ply][i])
+            to = (code >> 6) & 0x3F
+            flag = (code >> 15) & 7
+            promo = (code >> 12) & 7
+            if promo != 0 or flag == 2 or ((enemy_occ >> to) & 1):
+                captures.append(code)
+            elif want_checks and len(checks) < _QS_CHECK_CAP:
+                undo = movegen._make(bb, state, code)
+                if _in_check(bb, state):
+                    checks.append(code)
+                movegen._unmake(bb, state, code, undo)
+        move_list = list(_ordered(bb, turn, enemy_occ, captures + checks, -1, 0))
 
-    for move in _ordered(board, moves):
-        board.push(move)
-        score = -_qsearch(board, ply + 1, -beta, -alpha, deadline, qply + 1)
-        board.pop()
+    for raw in move_list:
+        code = int(raw)
+        undo = movegen._make(bb, state, code)
+        score = -_qsearch(bb, state, ply + 1, -beta, -alpha, deadline, qply + 1)
+        movegen._unmake(bb, state, code, undo)
         if score > best:
             best = score
         if score > alpha:
@@ -447,62 +484,107 @@ def _qsearch(
     return best
 
 
-def _ordered(board: chess.Board, moves: list[chess.Move], ply: int = -1) -> list[chess.Move]:
-    """Best-first: captures/promotions by MVV-LVA, then this ply's killer moves, then quiet
-    moves by history score. The caller places any transposition-table move ahead of all.
-    """
+def _ordered(
+    bb: npt.NDArray[np.uint64],
+    turn: int,
+    enemy_occ: int,
+    codes: list[int],
+    ply: int,
+    tt_move: int,
+) -> list[int]:
+    """Best-first ordering of move codes: TT move, then captures / promotions by MVV-LVA,
+    then this ply's killers, then quiet moves by history score."""
     base = ply * 2
     if 0 <= base < _KILLER_SLOTS - 1:
         killer0, killer1 = _killers[base], _killers[base + 1]
     else:
-        killer0 = killer1 = None
+        killer0 = killer1 = 0
 
-    def score(move: chess.Move) -> int:
-        if board.is_capture(move):
-            victim = board.piece_type_at(move.to_square) or chess.PAWN
-            attacker = board.piece_type_at(move.from_square) or chess.PAWN
-            promo = 0
-            if move.promotion == chess.QUEEN:
-                promo = 100
-            elif move.promotion is not None:
-                promo = 10
-            return _CAPTURE_BASE + 8 * victim - attacker + promo
-        if move.promotion is not None:
-            return _CAPTURE_BASE + (100 if move.promotion == chess.QUEEN else 10)
-        if move == killer0:
+    def score(code: int) -> int:
+        frm = code & 0x3F
+        to = (code >> 6) & 0x3F
+        promo = (code >> 12) & 7
+        flag = (code >> 15) & 7
+        is_ep = flag == 2
+        if is_ep or ((enemy_occ >> to) & 1):
+            victim = chess.PAWN if is_ep else _pt_at(bb, 1 - turn, to)
+            attacker = _pt_at(bb, turn, frm)
+            promo_bonus = 100 if promo == 4 else (10 if promo else 0)
+            return _CAPTURE_BASE + 8 * victim - attacker + promo_bonus
+        if promo != 0:
+            return _CAPTURE_BASE + (100 if promo == 4 else 10)
+        core = code & 0x7FFF
+        if core == killer0:
             return _KILLER_0
-        if move == killer1:
+        if core == killer1:
             return _KILLER_1
-        return _hist[move.from_square * 64 + move.to_square]
+        return _hist[frm * 64 + to]
 
-    return sorted(moves, key=score, reverse=True)
+    result = sorted(codes, key=score, reverse=True)
+    if tt_move:
+        for i, c in enumerate(result):
+            if (c & 0x7FFF) == tt_move:
+                result.insert(0, result.pop(i))
+                break
+    return result
 
 
-def _record_cutoff(move: chess.Move, ply: int, depth: int) -> None:
+def _pt_at(bb: npt.NDArray[np.uint64], colour: int, sq: int) -> int:
+    """1..6 piece type of `colour` on `sq`, else PAWN (matches the old `or chess.PAWN`)."""
+    b = 1 << sq
+    for pt in range(6):
+        if int(bb[colour, pt]) & b:
+            return pt + 1
+    return chess.PAWN
+
+
+def _record_cutoff(code: int, ply: int, depth: int) -> None:
     """A quiet move caused a beta cutoff: remember it as a killer for this ply and add to
     its history score, weighted by depth so deep cutoffs count for more."""
+    core = code & 0x7FFF
     base = ply * 2
-    if 0 <= base < _KILLER_SLOTS - 1 and _killers[base] != move:
+    if 0 <= base < _KILLER_SLOTS - 1 and _killers[base] != core:
         _killers[base + 1] = _killers[base]
-        _killers[base] = move
-    _hist[move.from_square * 64 + move.to_square] += depth * depth
+        _killers[base] = core
+    _hist[(code & 0x3F) * 64 + ((code >> 6) & 0x3F)] += depth * depth
 
 
 def _draw_score(ply: int) -> int:
     """Contempt: a draw is worth _CONTEMPT below equal from the root side's point of view.
     ply is even on the root side's turn, odd on the opponent's; the sign flips so the value
-    stays consistent through negamax's per-ply negation (and per-position, since a position
-    always recurs at the same ply parity).
+    stays consistent through negamax's per-ply negation.
     """
     return -_CONTEMPT if ply % 2 == 0 else _CONTEMPT
 
 
+def _log_move(
+    label: str, move: chess.Move, score: int, depth: int, clock_ms: int, started: float
+) -> None:
+    """One compact line per move to stderr, kept in the platform's per-game log so a rated
+    game can be diagnosed after the fact."""
+    ms = (time.monotonic() - started) * 1000.0
+    print(
+        f"[{label}] {move.uci()} d{depth} score {score:+d} nodes {_nodes} "
+        f"{ms:.0f}ms clock {clock_ms}",
+        flush=True,
+    )
+
+
+def _budget_s(board: chess.Board, time_left_ms: int, increment_ms: float) -> float:
+    """Time to spend on this move, in seconds. A sustainable share of the clock plus half
+    the increment, capped at a third of the clock, always leaving a reserve, floored at
+    10 ms. Assume at least 30 moves left so we do not drain the clock in a long game."""
+    moves_left = max(30, 56 - board.fullmove_number)
+    budget_ms = time_left_ms / moves_left + 0.5 * increment_ms
+    budget_ms = min(budget_ms, time_left_ms / 3.0, float(time_left_ms - _RESERVE_MS))
+    return max(budget_ms, 10.0) / 1000.0
+
+
 def _tb_root_move(board: chess.Board) -> str | None:
     """Best move straight from the Syzygy tables, in UCI, or None if the position is not
-    fully covered (too many men, a missing file, castling rights). Outcome first (WDL),
-    then Distance-To-Zero for the fastest win / most stubborn loss; a move that resets the
-    fifty-move counter (capture or pawn push) is preferred when winning and avoided when
-    losing, so a real conversion never stalls on the fifty-move rule.
+    fully covered. Outcome first (WDL), then Distance-To-Zero for the fastest win / most
+    stubborn loss; a move that resets the fifty-move counter is preferred when winning and
+    avoided when losing, so a real conversion never stalls on the fifty-move rule.
     """
     if _tablebase is None or chess.popcount(board.occupied) > _TB_MAX_PIECES:
         return None
@@ -513,7 +595,6 @@ def _tb_root_move(board: chess.Board) -> str | None:
             board.push(move)
             try:
                 mate = board.is_checkmate()
-                # our point of view: +ve wdl / +ve dtz == good for the side that just moved
                 wdl = 2 if mate else -_tablebase.probe_wdl(board)
                 dtz = 0 if mate else -_tablebase.probe_dtz(board)
             finally:
@@ -540,3 +621,21 @@ def _tick(deadline: float) -> None:
     _nodes += 1
     if _nodes % _CHECK_INTERVAL == 0 and time.monotonic() >= deadline:
         raise _Timeout
+
+
+def warm_up() -> None:
+    """Run one tiny search so every jitted specialisation the search path needs compiles
+    inside the 90 s init budget, not on the clock during move one. agent.py calls this at
+    import; tests just compile lazily on first use.
+    """
+    global _nodes, _last_depth, _seen, _tt_gen
+    try:
+        search_move(chess.Board(), 200)
+    finally:
+        _reset_tt()
+        _nodes = 0
+        _last_depth = 0
+        _seen = frozenset()
+        _tt_gen = 0
+        _killers[:] = [0] * _KILLER_SLOTS
+        _hist[:] = [0] * 4096
