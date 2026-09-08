@@ -146,14 +146,15 @@ def test_tt_persists_across_moves_and_cuts_nodes() -> None:
     search._killers[:] = [None] * search._KILLER_SLOTS
     search._hist[:] = [0] * 4096
 
+    full_window = (-search.MATE - 1, search.MATE + 1)
     search._tt_gen = (search._tt_gen + 1) & 0xFFFF
     search._nodes = 0
-    _, cold_score = search._search_root(board, 4, far, first_move)
+    _, cold_score = search._search_root(board, 4, far, first_move, *full_window)
     cold_nodes = search._nodes
 
     search._tt_gen = (search._tt_gen + 1) & 0xFFFF
     search._nodes = 0
-    _, warm_score = search._search_root(board, 4, far, first_move)
+    _, warm_score = search._search_root(board, 4, far, first_move, *full_window)
     warm_nodes = search._nodes
 
     assert warm_score == cold_score
@@ -170,7 +171,10 @@ def test_tt_stores_no_value_it_cannot_encode() -> None:
     search._hist[:] = [0] * 4096
     search._tt_gen = (search._tt_gen + 1) & 0xFFFF
     search._nodes = 0
-    search._search_root(board, 6, time.monotonic() + 120, next(iter(board.legal_moves)))
+    search._search_root(
+        board, 6, time.monotonic() + 120, next(iter(board.legal_moves)),
+        -search.MATE - 1, search.MATE + 1,
+    )
 
     occupied = search._tt_key != 0
     assert int(occupied.sum()) > 0

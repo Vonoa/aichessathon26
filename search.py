@@ -50,6 +50,7 @@ _QS_CHECK_CAP = 6  # at most this many quiet checking moves added per quiescence
 _EXACT, _LOWER, _UPPER = 0, 1, 2  # transposition-table bound kinds
 _LMR_MIN_DEPTH = 3  # only reduce late moves with this much depth left
 _LMR_MIN_MOVE = 3  # first this many moves at each node are searched at full depth
+_ASPIRATION = 40  # centipawns; the half-width of the first window around the last score
 
 # Move-ordering score bands: captures and promotions on top, then the two killer slots
 # for this ply, then quiet moves ranked by the history heuristic (well below these).
@@ -156,8 +157,15 @@ def search_move(
     best = _ordered(board, legal)[0]
     score = 0
     for depth in range(1, _MAX_DEPTH + 1):
+        # Aspiration: past the shallow passes, search a narrow window around the last
+        # score. A hit gives more cutoffs (deeper reach); a miss widens and re-searches,
+        # which the persistent TT makes cheap.
+        if depth <= 3:
+            alpha, beta = -MATE - 1, MATE + 1
+        else:
+            alpha, beta = score - _ASPIRATION, score + _ASPIRATION
         try:
-            move, score = _search_root(board, depth, deadline, best)
+            move, score = _aspiration_search(board, depth, deadline, best, alpha, beta)
         except _Timeout:
             break
         best = move
@@ -201,8 +209,24 @@ def _budget_s(board: chess.Board, time_left_ms: int, increment_ms: float) -> flo
     return max(budget_ms, 10.0) / 1000.0
 
 
+def _aspiration_search(
+    board: chess.Board, depth: int, deadline: float, first: chess.Move, alpha: int, beta: int
+) -> tuple[chess.Move, int]:
+    """Run _search_root, and if the result falls outside (alpha, beta) widen that side to
+    infinity and try once more. At most one re-search per side, so two searches worst case.
+    """
+    while True:
+        move, score = _search_root(board, depth, deadline, first, alpha, beta)
+        if score <= alpha and alpha > -MATE - 1:
+            alpha = -MATE - 1
+        elif score >= beta and beta < MATE + 1:
+            beta = MATE + 1
+        else:
+            return move, score
+
+
 def _search_root(
-    board: chess.Board, depth: int, deadline: float, first: chess.Move
+    board: chess.Board, depth: int, deadline: float, first: chess.Move, alpha: int, beta: int
 ) -> tuple[chess.Move, int]:
     moves = _ordered(board, list(board.legal_moves))
     if first in moves:
@@ -211,15 +235,23 @@ def _search_root(
 
     best_move = moves[0]
     best_score = -MATE - 1
-    alpha = -MATE - 1
-    for move in moves:
+    for i, move in enumerate(moves):
         board.push(move)
-        score = -_negamax(board, depth - 1, 1, -MATE - 1, -alpha, deadline)
+        if i == 0:
+            score = -_negamax(board, depth - 1, 1, -beta, -alpha, deadline)
+        else:
+            # Scout with a null window; only re-search in full if it beats alpha.
+            score = -_negamax(board, depth - 1, 1, -alpha - 1, -alpha, deadline)
+            if alpha < score < beta:
+                score = -_negamax(board, depth - 1, 1, -beta, -alpha, deadline)
         board.pop()
         if score > best_score:
             best_score = score
             best_move = move
-        alpha = max(alpha, score)
+        if score > alpha:
+            alpha = score
+        if alpha >= beta:
+            break  # fail-high at the root; _aspiration_search widens and re-searches
     return best_move, best_score
 
 
@@ -280,22 +312,24 @@ def _negamax(
         quiet = move.promotion is None and not board.is_capture(move)
         board.push(move)
 
-        # Late-move reduction: quiet moves ordered late are probably bad, so search them
-        # shallower first; if one beats alpha anyway, re-search it at full depth.
-        reduce = (
-            quiet
-            and not in_check
-            and depth >= _LMR_MIN_DEPTH
-            and move_index >= _LMR_MIN_MOVE
-            and not board.is_check()
-        )
-        if reduce:
-            r = 2 if move_index >= _LMR_MIN_MOVE + 3 else 1
-            score = -_negamax(board, depth - 1 - r, ply + 1, -beta, -alpha, deadline)
-            if score > alpha:
-                score = -_negamax(board, depth - 1, ply + 1, -beta, -alpha, deadline)
-        else:
+        if move_index == 0:
+            # The principal variation: search it in full to establish a real bound.
             score = -_negamax(board, depth - 1, ply + 1, -beta, -alpha, deadline)
+        else:
+            # Late-move reduction: quiet moves ordered late are probably bad, so scout
+            # them shallower. Every non-PV move is scouted with a null window; if the
+            # scout beats alpha (or a reduced scout does), re-search it in full.
+            reduce = (
+                quiet
+                and not in_check
+                and depth >= _LMR_MIN_DEPTH
+                and move_index >= _LMR_MIN_MOVE
+                and not board.is_check()
+            )
+            r = (2 if move_index >= _LMR_MIN_MOVE + 3 else 1) if reduce else 0
+            score = -_negamax(board, depth - 1 - r, ply + 1, -alpha - 1, -alpha, deadline)
+            if score > alpha and (r > 0 or score < beta):
+                score = -_negamax(board, depth - 1, ply + 1, -beta, -alpha, deadline)
 
         board.pop()
         if score > value:

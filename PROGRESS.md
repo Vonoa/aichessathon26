@@ -337,3 +337,23 @@ unbounded dict"). A fresh process per game resets it; tests call `search._reset_
   to `test_is_deterministic` (the carried-over table is otherwise a hidden input).
 - Gate + bench (watch for an nps change from the packed probe) + arena vs
   `versions/phase5jit` pending.
+
+### 2026-09-08 -- Aspiration windows + principal variation search (branch `aspiration`)
+
+Next two items of the Phase 4 pruning stack, on top of the persistent TT.
+
+- **PVS.** In `_search_root` and `_negamax`, the first (PV) move is searched with the
+  full (alpha, beta) window; every later move is scouted with a null window
+  (-alpha-1, -alpha) and only re-searched in full if the scout beats alpha (for a
+  reduced LMR scout, any beat triggers the re-search; for an unreduced one, only a
+  beat strictly below beta). Folds the old separate LMR re-search into the same path.
+- **Aspiration.** `search_move` now drives the root through `_aspiration_search`: for
+  depth > 3 the window is `last_score +- _ASPIRATION` (40 cp). A result outside it
+  widens that side to infinity and re-searches once -- cheap now that the persistent
+  TT carries the tree between the narrow and wide passes.
+- Local checks: mate-in-1 still solved, `get_move` still deterministic, and a
+  fixed-depth root search with the narrow window stays within ~10% of the
+  full-window node count (no blow-up from re-searches).
+- Gate + bench (depth reached in fixed time is the signal) + arena vs
+  `versions/phase5jit` pending. If the bench shows aspiration costing depth on
+  volatile scores, widen `_ASPIRATION` or gate it to deeper plies; PVS stays either way.
