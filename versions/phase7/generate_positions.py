@@ -65,19 +65,35 @@ def play_random_opening(rng: random.Random, min_plies: int = 4, max_plies: int =
     return board
 
 
+def _is_quiet(board: chess.Board) -> bool:
+    """No check, no legal capture or promotion available. The net only ever
+    scores leaves -- qsearch resolves everything else (captures, promotions,
+    the position right before a recapture) before evaluate() is ever called
+    on it in a real game, per docs/phase7-nnue.md. Training on a non-quiet
+    position teaches the net to score inputs it will never actually see."""
+    if board.is_check():
+        return False
+    return not any(board.is_capture(m) or m.promotion is not None for m in board.legal_moves)
+
+
 def continue_with_engine(board: chess.Board, get_move_fn, rng: random.Random,
                           max_plies: int = 60, sample_every: int = 4,
-                          time_left_ms: int = 250) -> list[str]:
+                          time_left_ms: int = 250, skip_plies: int = 8) -> list[str]:
     """get_move_fn(fen, time_left_ms) -> uci string. Pass your real agent's
     get_move so generated positions reflect positions YOUR engine actually
     reaches, not some other distribution. Add a small amount of move noise
     (occasionally play the 2nd-best move) upstream in get_move_fn if you want
-    more positional diversity -- not done here to keep this file engine-agnostic."""
+    more positional diversity -- not done here to keep this file engine-agnostic.
+
+    skip_plies: the first few plies past the random opening are still close to
+    book theory rather than the engine's own judgement; skip them the same
+    way skip_plies == 0 would still sample directly out of play_random_opening.
+    """
     fens = []
     for ply in range(max_plies):
         if board.is_game_over():
             break
-        if ply % sample_every == 0:
+        if ply >= skip_plies and ply % sample_every == 0 and _is_quiet(board):
             fens.append(board.fen())
         uci = get_move_fn(board.fen(), time_left_ms)
         move = chess.Move.from_uci(uci)
@@ -112,10 +128,9 @@ def generate_dataset(
             if reset_fn is not None:
                 reset_fn()
             board = play_random_opening(rng)
-            fens = [board.fen()]
-            fens += continue_with_engine(
-                board, get_move_fn, rng, time_left_ms=time_left_ms
-            )
+            # continue_with_engine's own skip_plies/quiet filter decides what's sampled,
+            # including from ply 0 here -- no unconditional pre-opening FEN tacked on.
+            fens = continue_with_engine(board, get_move_fn, rng, time_left_ms=time_left_ms)
             result = outcome_to_result(board)
             for fen in fens:
                 f.write(f"{game_id}\t{fen}\t{result}\n")
@@ -139,7 +154,7 @@ if __name__ == "__main__":
 
     repo_root = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(repo_root))
-    import agent  # noqa: E402  (path must be set up first)
+    import agent
 
     def _reset_agent_state() -> None:
         agent._history.clear()
