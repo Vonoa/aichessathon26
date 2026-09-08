@@ -255,3 +255,17 @@ definitions live in [docs/PLAN.md](docs/PLAN.md).
   values re-captured (a deliberate eval rework); the symmetric golden stays 0, the
   phase-faded endgame goldens are unchanged.
 - Gate + arena vs `versions/phase5jit` pending.
+
+### 2026-09-07 — Endgame king activity (branch `endgame-king-activity`)
+
+- New white-relative eval term `_king_activity` / jitted `_king_activity_jit`, added after
+  the tapered blend alongside the mate driver. Fires only when game phase < 8, one side
+  leads by >= 200 cp (pawn+piece value), and the trailing side is not a bare king (that's
+  the mate driver's job). Rewards the leading side `6 * (7 - Chebyshev(kings))`, faded
+  linearly to 0 at the phase ceiling -- a small tie-breaker that turns aimless shuffling
+  (Rated 57: promoted a queen, drew by threefold with the king wandering) into "march the
+  king toward the enemy to finish".
+- `_material_lead` helper added. Reference and jit changed identically; equivalence test
+  covers new endgame FENs. Zero golden-value changes (the bare-king guard + phase gate +
+  lead gate keep every golden position out of scope).
+- Gate + arena vs `versions/phase5jit` pending.

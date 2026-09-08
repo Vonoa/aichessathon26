@@ -210,6 +210,24 @@ def test_mopup_is_silent_with_pieces_on_both_sides() -> None:
     assert evaluate._mopup(board) == 0
 
 
+def test_king_activity_marches_the_leading_king_in() -> None:
+    # White up a rook, deep endgame, Black king + a pawn: leading king near the enemy
+    # scores above the same king shoved into a corner.
+    near = chess.Board("8/5k2/4p3/8/8/3K4/5R2/8 w - - 0 1")
+    far = chess.Board("8/5k2/4p3/8/8/8/5R2/K7 w - - 0 1")
+    assert evaluate.evaluate(near) > evaluate.evaluate(far)
+    assert evaluate._king_activity(near) > evaluate._king_activity(far) > 0
+
+
+def test_king_activity_silent_in_the_middlegame_and_when_level() -> None:
+    mid = chess.Board("r1bq1rk1/pp2bppp/2n1pn2/2pp4/3P1B2/2PBPN2/PP1N1PPP/R2Q1RK1 w - - 0 9")
+    level = chess.Board("8/5k2/8/8/8/3K4/3R1r2/8 w - - 0 1")   # R vs R, no lead
+    bare = chess.Board("8/5k2/8/8/8/3K4/5R2/8 w - - 0 1")      # KR vs K -> mopup's job
+    assert evaluate._king_activity(mid) == 0
+    assert evaluate._king_activity(level) == 0
+    assert evaluate._king_activity(bare) == 0
+
+
 def _black_king_safety(fen: str) -> int:
     board = chess.Board(fen)
     return evaluate._king_safety_mg(
