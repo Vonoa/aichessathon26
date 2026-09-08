@@ -1,8 +1,14 @@
 # How the engine works — the maths and the ideas
 
 Reference for the team and the finals walkthrough. Covers every technique in `search.py`
-and `evaluate.py` and why it is there. Companion to [PROGRESS.md](../PROGRESS.md) (history)
-and [HANDOVER.md](../HANDOVER.md) (current task).
+and `evaluate.py` and why it is there. Companion to [PROGRESS.md](../PROGRESS.md)
+(history), [PLAN.md](PLAN.md) (what's next), and [phase7-nnue.md](phase7-nnue.md) (the
+NNUE track).
+
+Current as of build `diag-8`: jitted-eval negamax with the full classical pruning stack
+(persistent TT, PVS, aspiration windows, LMR, killers/history, check extension,
+quiescence with a ply of quiet checks) and 3-man Syzygy. Reaches depth 5-7 in the
+middlegame on the match machine.
 
 ---
 
@@ -85,11 +91,16 @@ time a quiet move causes a cutoff we add `depth * depth` to its cell. The `depth
 means a cutoff found deep in the tree (where searching is expensive) counts far more than a
 shallow one. Remaining quiet moves are ordered by this score.
 
-The transposition-table move (section 5), if any, is forced ahead of all of these.
+The transposition-table move (section 6), if any, is forced ahead of all of these, and
+in quiescence a small number of non-capturing checking moves are appended after the
+captures (section 7).
 
 Killers and history reset every move (`search_move` clears them). They compound *with
-depth* — at depth 2-3 they measure flat, which is why the engine is currently search-
-feature-saturated and eval-speed-bound.
+depth*: at depth 2-3 they measured flat, but the jitted eval and the persistent TT now
+put the engine at depth 5-7 in the middlegame, where ordering quality is what buys the
+extra plies. **SEE (static exchange evaluation) is the notable gap** — captures are
+still ordered by MVV-LVA alone, so `QxP` defended sorts above `PxN`, and quiescence
+searches every capture including the losing ones.
 
 ---
 
@@ -115,6 +126,13 @@ so the overhead over just searching depth `d` once is a *constant fraction*, abo
    you try it first and alpha-beta prunes `d+1` far harder. Iterative deepening usually
    pays for its own overhead this way.
 
+**Aspiration windows.** Past depth 3, instead of searching `(-inf, +inf)` we open the
+window at `last_score ± _ASPIRATION` (40 cp). A search that stays inside gets far more
+cutoffs — the tighter beta refutes bad lines sooner. If the true score falls outside,
+`_aspiration_search` widens that side to infinity and re-searches once (at most two
+searches per depth), and the persistent TT (section 6) makes that re-search cheap
+because the whole tree is still cached.
+
 ---
 
 ## 6. Transposition table
@@ -122,26 +140,40 @@ so the overhead over just searching depth `d` once is a *constant fraction*, abo
 Different move orders reach the same position ("transpose"): `1.e4 e5 2.Nf3` and
 `1.Nf3 e5 2.e4` are identical. Without a cache the search explores that subtree twice.
 
-We key a dict on `board._transposition_key()` — a hashable tuple of piece placement, side
-to move, castling rights and en-passant square (the same thing python-chess uses for
-repetition detection). Each entry stores `(depth, value, bound, best_move)`.
+**The table is persistent and fixed-size** — kept across moves within a game (a fresh
+process per game resets it for free). It is two flat `uint64` numpy arrays of `2^22`
+(~4.2 M) slots, ~64 MB, allocated once at import: `_tt_key` holds a 64-bit hash of
+`board._transposition_key()` (0 marks an empty slot), and `_tt_data` packs one entry
+into 64 bits — value (16), depth (8), bound flag (2), best-move code (16), and a
+16-bit **generation** stamp. Open-addressed: `slot = key64 & mask`, one probe. An
+unbounded dict here would churn GC and eat the 2 GB (the crowd's mistake).
+
+`search_move` bumps `_tt_gen` each move instead of clearing. On a store, a slot is
+overwritten if it is empty, holds a different position, is from an older generation, or
+holds a shallower result for this position — **replace-by-depth within a generation,
+always-replace across generations**. This is what makes it safe to keep entries for a
+whole game: a stale-generation entry (which may carry a path-dependent repetition draw
+score) is refreshed within a move or two.
 
 **Bound kinds** — a fail-soft alpha-beta value is not always exact:
 - `_EXACT` — the search completed inside the window; `value` is the true score.
 - `_LOWER` — a beta cutoff happened; the true score is `>= value` (a floor).
 - `_UPPER` — no move beat alpha; the true score is `<= value` (a ceiling).
 
-On entering a node, if a stored entry was searched at least as deep as we need now
-(`e_depth >= depth`):
+On entering a node, if the slot holds this position (`_tt_key[slot] == key64`) and was
+searched at least as deep as we need (`e_depth >= depth`):
 - `_EXACT` -> return it.
 - `_LOWER` and `value >= beta` -> return it (already good enough to cut).
 - `_UPPER` and `value <= alpha` -> return it (already too weak to matter).
 
 Otherwise the stored `best_move` is still used as the first move to try.
 
-**Not cached:** mate scores (they are root-relative, section 7) and the draw scores from
-repetition detection (path-dependent). The table is cleared every move for now; a
-persistent fixed-size table is on the backlog.
+**Not stored:** any value with `abs(value) >= _TT_VALUE_MAX` (30,000). That one check
+covers both mate scores (root-relative, section 8) and any score too large for the
+16-bit field. Repetition / already-seen draws return before the store is reached, so
+they are never cached directly; a value merely *derived* from a repetition deeper down
+is path-dependent but the generation stamp ages it out (contempt bounds the error to
+±25).
 
 ---
 
@@ -152,14 +184,22 @@ exchange** — "I'm up a queen!" one ply before the recapture. The evaluation is
 a position it was never designed for and is wrong. This is the *horizon effect*.
 
 **Quiescence search** (`_qsearch`): at the horizon, instead of evaluating immediately, keep
-searching **captures only** (plus all legal moves when in check, since being in check is
-not "quiet") until no forcing move remains, then evaluate.
+searching **captures and promotions** (plus all legal moves when in check, since being in
+check is not "quiet") until no forcing move remains, then evaluate.
 
 - **Stand-pat**: the side to move can usually do at least as well as the static score by
   *not* capturing, so `stand_pat = evaluate(board)` is a lower bound. If `stand_pat >= beta`
   we cut immediately; if `stand_pat > alpha` it raises alpha.
-- It **terminates** because material runs out — capture chains are short.
+- **One ply of quiet checks.** For the first `_QS_CHECK_PLIES` (1) plies past the horizon,
+  when not in check, up to `_QS_CHECK_CAP` (6) non-capturing checking moves are appended
+  to the capture list. This catches the forcing shot — a knight fork with check, a
+  back-rank skewer — that a captures-only quiescence walks straight past. It can only
+  raise the score (a bad check just scores low and is ignored), so stand-pat stays sound.
+- It **terminates** because material runs out (capture chains are short) and the check
+  window closes after one ply.
 - A `_QS_MAX_PLY` cap is a safety net against pathological check/capture loops.
+- **Not done:** delta pruning (skip a capture whose best-case material gain still leaves
+  `stand_pat + gain + margin < alpha`) and SEE pruning of losing captures.
 
 ---
 
@@ -192,7 +232,15 @@ this is path-consistent: propagate a draw score up the tree and every node sees 
 
 ---
 
-## 10. Search extensions and reductions
+## 10. Search extensions, reductions, and PVS
+
+**Principal variation search (PVS).** After the first move at a node is searched with the
+full `(alpha, beta)` window, every later move is first scouted with a **null window**
+`(-alpha-1, -alpha)` — a yes/no question, "does this beat what we already have?" A null
+window prunes far harder. Only if the scout comes back `> alpha` (and, for an unreduced
+move, `< beta`) do we re-search it with the full window for its exact value. Most later
+moves fail the scout and cost one cheap search instead of two. Applied at the root
+(`_search_root`) and every interior node (`_negamax`).
 
 **Check extension.** When a node is in check, `depth += 1` before recursing — a forcing
 line gets a full extra ply to resolve before evaluation, so short tactical shots are not
@@ -200,10 +248,14 @@ cut off by the horizon.
 
 **Late-move reductions (LMR).** Moves ordered late are probably bad (that is what the
 ordering is for). For a *quiet* move past `_LMR_MIN_MOVE`, at `depth >= _LMR_MIN_DEPTH`, not
-in or giving check, search it first at `depth - 1 - r` (`r` = 1, or 2 for very late moves).
-If that reduced search still beats alpha it "surprised" us, so re-search it at full depth.
-Net effect: the search spends its nodes on the moves that matter. (Currently measures flat
-because the search is eval-bound, not node-bound — it will pay off after the eval jit.)
+in or giving check, the null-window scout runs at `depth - 1 - r` (`r` = 1, or 2 for very
+late moves). If that reduced scout still beats alpha it "surprised" us, so re-search it at
+full depth. Net effect: the search spends its nodes on the moves that matter. This now
+pays — the engine is node-bound at depth 5-7, not eval-bound.
+
+**Not done:** null-move pruning (tried at d3-d4, -83 Elo, reverted — worth a retry now),
+futility / reverse-futility pruning, late-move (move-count) pruning, singular extensions.
+See `docs/PLAN.md` -> "Depth without the jitted movegen".
 
 ---
 
@@ -247,17 +299,42 @@ safe direction (smaller increment -> smaller budget).
 
 ---
 
-## 12. Evaluation — `evaluate.py`
+## 12. Endgame tablebases (Syzygy)
+
+For positions with very few pieces the search is replaced by a lookup. `search.py` opens
+whatever `.rtbw` / `.rtbz` files sit in `syzygy/` at import (wrapped so a missing or bad
+folder just disables the feature). We ship the **3-man** set (K+P/Q/R/B/N vs K, ~26 KB).
+
+When `search_move` is handed a position with `<= _TB_MAX_PIECES` (5) men and the tables
+are loaded, `_tb_root_move` decides the move directly and the search never runs:
+
+- For each legal move, probe **WDL** (win / draw / loss, respecting the 50-move rule) and
+  **DTZ** (distance to zeroing — plies until the next capture, pawn move, or mate) from
+  our point of view.
+- Rank by best WDL first. Among those: when winning, prefer an immediate mate, then a
+  move that resets the fifty-move counter, then the smallest DTZ (fastest conversion);
+  when losing, the largest `|DTZ|` (drag it out) and keep the counter running; a draw
+  just holds.
+
+WDL alone is not enough — every move in a won K+R-vs-K keeps the win, so a WDL-only
+search with the mop-up gradient (section 13.6) just orbits the lone king without mating.
+DTZ is the ordering that actually converges: it mates K+R-vs-K in 27 plies, K+Q-vs-K in
+11, and correctly *holds* a drawn K+P-vs-K.
+
+The package step must be told to bundle the folder (`--include syzygy` / `make zip`), or
+the tables do not ship and the engine silently falls back to searching.
+
+## 13. Evaluation — `evaluate.py`
 
 Returns a centipawn score (1 pawn = 100) from the **side-to-move's** point of view.
 
-### 12.1 Material
+### 13.1 Material
 
 `P=100  N=320  B=330  R=500  Q=900`, king 0 (its value is handled by mate detection). Bishop
 slightly above knight is a crude bishop-pair proxy. Counted with `int.bit_count()` on the
 piece bitboards masked by colour — no per-square Python loop.
 
-### 12.2 Piece-square tables
+### 13.2 Piece-square tables
 
 A `[64]` table per piece giving a centipawn bonus for that piece on that square (knights
 toward the centre, rooks toward open files and the 7th, a midgame king in the corner, an
@@ -271,7 +348,7 @@ subtracted. (The PeSTO arrays are written rank-8-first, so they are flipped once
 by `_flip_ranks` to match `a1 = 0` — getting this wrong made the midgame king want to march
 up the board.)
 
-### 12.3 Tapered evaluation
+### 13.3 Tapered evaluation
 
 A queen matters differently in a queenless endgame; the king wants opposite things in the
 middlegame and the endgame. So every square-dependent term has a **midgame** and an
@@ -290,7 +367,7 @@ score = ( mg_score * phase  +  eg_score * (24 - phase) ) / 24
 with `int(.../24)` (truncate toward zero) rather than `//` (which rounds toward negative
 infinity and would make a position and its colour-mirror differ by 1 cp).
 
-### 12.4 Pawn structure
+### 13.4 Pawn structure
 
 Per side, in centipawns:
 - **Doubled** — `-12` per extra pawn on a file (two pawns on the e-file = one penalty).
@@ -300,38 +377,59 @@ Per side, in centipawns:
   no enemy pawn stands on the same or an adjacent file ahead of it — nothing can stop it
   promoting except pieces.
 
-### 12.5 Mobility
+### 13.5 Mobility
 
-For each knight, bishop, rook, queen: count the squares it attacks
-(`board.attacks_mask(sq).bit_count()`) and multiply by a small weight (a few cp per square,
-slightly higher in the endgame). A crude "active pieces are worth more" term. The
-`attacks_mask` calls for the sliding pieces are the current per-node bottleneck and the
-reason for the eval jit.
+For each knight, bishop, rook, queen: count the squares it attacks and multiply by a
+small weight (a few cp per square, slightly higher in the endgame). A crude "active
+pieces are worth more" term. In the jitted path the attack sets come from a jitted ray
+walk, not `board.attacks_mask`. The weights (4 cp/square for a minor) are low enough
+that a boxed-in bishop is only ~20 cp worse than a free one — probably too weak to steer
+a move choice, which is one reason trapped-piece lines slip through (Rated 67).
 
-### 12.6 King safety (midgame only, phase-faded)
+### 13.6 King safety (midgame only, phase-faded)
 
-Computed on the `mg_score` side only, because an exposed king is a middlegame liability but
-in the endgame the king is *supposed* to walk into the open. The phase blend then fades it
-out: at `phase = 0` it contributes exactly nothing.
+Computed on the `mg_score` side only, because an exposed king is a middlegame liability
+but in the endgame the king is *supposed* to walk into the open. The phase blend fades it
+to exactly nothing at `phase = 0`.
 
 - **Pawn shield** — `+12` per friendly pawn on the three files in front of the king.
 - **Open / half-open file** near the king — `-22` if neither side has a pawn on a file
   beside the king, `-12` if only the enemy does.
-- **Attacker zone** — for each enemy piece whose attacks reach the king's 3x3 zone,
-  subtract a weight by piece type (`P 2, N/B 6, R 9, Q 14`). Linear, which is crude — real
-  king safety is non-linear in the number of attackers — but a reasonable placeholder.
+- **Non-linear attacker zone.** Sum `unit x (king-zone squares the piece attacks)` over
+  every enemy piece bearing on the king's 3x3 zone (`unit`: P 2, N 3, B 3, R 5, Q 7), and
+  count how many pieces contribute. With **0 or 1** attacker the penalty is just
+  `-danger` (a lone piece is easily met). With **2 or more** it is
+  `-min(450, danger^2 x 65 / 100)` — quadratic in the pile-up, capped near a rook. This
+  is the real "an attack is worth more than the sum of its parts" shape. A parked
+  `king-safety-v2` branch adds missing-flight-square and off-back-rank terms; it did not
+  fix the Greek-gift losses (those are a horizon problem — the mating pieces arrive after
+  the leaf) so it is held.
 
-### 12.7 The weights are placeholders
+### 13.7 Endgame drivers — mop-up and king activity
+
+Two small white-relative terms added *after* the tapered blend:
+
+- **Mop-up** (`_mopup`) — active only when exactly one side is a bare king. Pushes the
+  lone king toward a corner (`16 x` its centre-Manhattan distance) and marches the
+  winning king in (`8 x (7 - Chebyshev(kings))`). A gradient to convert K+X-vs-K by, not
+  a material term. (Below <=3 men Syzygy takes over entirely, section 12.)
+- **King activity** (`_king_activity`) — when game phase `< 8`, one side leads by `>= 200`
+  cp, and the trailing side is not a bare king: reward the leader for closing its king on
+  the enemy king, faded to 0 at the phase ceiling. Turns aimless endgame shuffling into
+  progress.
+
+### 13.8 The weights are placeholders
 
 Every number above is a hand-picked or public starting value, not tuned for *our* search.
 The real gain is **Texel tuning**: play a few hundred thousand self-play positions, label
 each with the eventual game result (1 / 0.5 / 0), and fit the weights by logistic
-regression so `sigmoid(k * eval)` best predicts the result. That is a separate data project
-(overlaps the teammate's work).
+regression so `sigmoid(k * eval)` best predicts the result. `evaluate.py` keeps a
+pure-Python `_evaluate_reference` specifically to tune against; the jitted path reads the
+same tables. Overlaps the teammate's NNUE data work — see `docs/phase7-nnue.md`.
 
 ---
 
-## 13. Bit tricks used throughout
+## 14. Bit tricks used throughout
 
 A **bitboard** is a 64-bit integer, one bit per square (bit `i` = square `i`, `a1 = 0`).
 
