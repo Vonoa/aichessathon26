@@ -28,6 +28,7 @@ dev = [
     "pytest>=8",
     "onnx>=1.22.0",
     "onnxscript>=0.7.1",
+    "zstandard>=0.25.0",
 ]
 
 [tool.pytest.ini_options]

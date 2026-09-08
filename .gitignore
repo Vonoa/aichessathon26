@@ -4,3 +4,11 @@ __pycache__/
 .ruff_cache/
 submission.zip
 *.pgn
+
+# Phase 7: large intermediate data files, reconstructable from the pipeline scripts
+# + the (much smaller) final labelled dataset that IS kept for provenance.
+versions/phase7/raw_positions_lichess.tsv
+versions/phase7/raw_combined.tsv
+versions/phase7/raw_lichess_quiet_sample.tsv
+versions/phase7/deduped_combined.tsv
+versions/phase7/chunks/
