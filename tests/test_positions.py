@@ -7,15 +7,18 @@ the gate. tests/ is never packaged.
 import pytest
 
 import agent
+import search
 
 
 @pytest.fixture(autouse=True)
 def _reset_state():
     agent._history.clear()
     agent._clock.clear()
+    search._reset_tt()
     yield
     agent._history.clear()
     agent._clock.clear()
+    search._reset_tt()
 
 
 @pytest.mark.xfail(
