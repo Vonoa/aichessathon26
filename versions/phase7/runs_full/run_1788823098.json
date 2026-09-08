@@ -1,0 +1,70 @@
+{
+  "timestamp": 1788823098.091322,
+  "duration_s": 7.094301700592041,
+  "git_commit": "d60f28748ef78e38e163a02c3b236a9ee432fb29",
+  "dataset_path": "versions/phase7/labelled_selfplay.tsv",
+  "dataset_hash": "f01a2f060a802d79",
+  "dataset_size": 3875,
+  "n_train": 3488,
+  "n_val": 387,
+  "hyperparameters": {
+    "epochs": 10,
+    "batch_size": 256,
+    "lr": 0.001,
+    "seed": 0,
+    "val_fraction": 0.1
+  },
+  "history": [
+    {
+      "epoch": 0,
+      "train_loss": 0.05848717313567433,
+      "val_loss": 0.0530895444850897
+    },
+    {
+      "epoch": 1,
+      "train_loss": 0.046668052229039164,
+      "val_loss": 0.03841576406621502
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.031328519191080276,
+      "val_loss": 0.03115935717981299
+    },
+    {
+      "epoch": 3,
+      "train_loss": 0.023083909935907487,
+      "val_loss": 0.024911729686289488
+    },
+    {
+      "epoch": 4,
+      "train_loss": 0.01644757374642639,
+      "val_loss": 0.020225251132011107
+    },
+    {
+      "epoch": 5,
+      "train_loss": 0.012172132046944504,
+      "val_loss": 0.018289372782182015
+    },
+    {
+      "epoch": 6,
+      "train_loss": 0.009169946108526046,
+      "val_loss": 0.016795254199349297
+    },
+    {
+      "epoch": 7,
+      "train_loss": 0.007213802093964651,
+      "val_loss": 0.014338992617889585
+    },
+    {
+      "epoch": 8,
+      "train_loss": 0.005301671999788612,
+      "val_loss": 0.013122862019607417
+    },
+    {
+      "epoch": 9,
+      "train_loss": 0.0041507927000249195,
+      "val_loss": 0.012741388120142218
+    }
+  ],
+  "checkpoint_path": "versions\\phase7\\runs_full\\model.pt"
+}

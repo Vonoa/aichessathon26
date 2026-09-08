@@ -22,7 +22,14 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [dependency-groups]
-dev = ["mypy>=1.18", "ruff>=0.14", "pytest>=8"]
+dev = [
+    "mypy>=1.18",
+    "ruff>=0.14",
+    "pytest>=8",
+    "onnx>=1.22.0",
+    "onnxscript>=0.7.1",
+    "zstandard>=0.25.0",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

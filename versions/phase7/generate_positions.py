@@ -65,19 +65,35 @@ def play_random_opening(rng: random.Random, min_plies: int = 4, max_plies: int =
     return board
 
 
+def _is_quiet(board: chess.Board) -> bool:
+    """No check, no legal capture or promotion available. The net only ever
+    scores leaves -- qsearch resolves everything else (captures, promotions,
+    the position right before a recapture) before evaluate() is ever called
+    on it in a real game, per docs/phase7-nnue.md. Training on a non-quiet
+    position teaches the net to score inputs it will never actually see."""
+    if board.is_check():
+        return False
+    return not any(board.is_capture(m) or m.promotion is not None for m in board.legal_moves)
+
+
 def continue_with_engine(board: chess.Board, get_move_fn, rng: random.Random,
                           max_plies: int = 60, sample_every: int = 4,
-                          time_left_ms: int = 2000) -> list[str]:
+                          time_left_ms: int = 250, skip_plies: int = 8) -> list[str]:
     """get_move_fn(fen, time_left_ms) -> uci string. Pass your real agent's
     get_move so generated positions reflect positions YOUR engine actually
     reaches, not some other distribution. Add a small amount of move noise
     (occasionally play the 2nd-best move) upstream in get_move_fn if you want
-    more positional diversity -- not done here to keep this file engine-agnostic."""
+    more positional diversity -- not done here to keep this file engine-agnostic.
+
+    skip_plies: the first few plies past the random opening are still close to
+    book theory rather than the engine's own judgement; skip them the same
+    way skip_plies == 0 would still sample directly out of play_random_opening.
+    """
     fens = []
     for ply in range(max_plies):
         if board.is_game_over():
             break
-        if ply % sample_every == 0:
+        if ply >= skip_plies and ply % sample_every == 0 and _is_quiet(board):
             fens.append(board.fen())
         uci = get_move_fn(board.fen(), time_left_ms)
         move = chess.Move.from_uci(uci)
@@ -93,13 +109,28 @@ def outcome_to_result(board: chess.Board) -> float:
     return {"1-0": 1.0, "0-1": 0.0, "1/2-1/2": 0.5}.get(result, 0.5)
 
 
-def generate_dataset(n_games: int, out_path: str, get_move_fn, seed: int = 0) -> None:
+def generate_dataset(
+    n_games: int,
+    out_path: str,
+    get_move_fn,
+    seed: int = 0,
+    time_left_ms: int = 1000,
+    reset_fn=None,
+) -> None:
+    """reset_fn, if given, is called before each simulated game. Required when
+    get_move_fn wraps a module with cross-move state meant to persist for one real
+    game (agent.py's `_history` / `_clock` globals) -- without resetting it, that
+    state leaks between the independent games generated here and corrupts
+    repetition detection and increment inference for every game after the first."""
     rng = random.Random(seed)
     with open(out_path, "w") as f:
         for game_id in range(n_games):
+            if reset_fn is not None:
+                reset_fn()
             board = play_random_opening(rng)
-            fens = [board.fen()]
-            fens += continue_with_engine(board, get_move_fn, rng)
+            # continue_with_engine's own skip_plies/quiet filter decides what's sampled,
+            # including from ply 0 here -- no unconditional pre-opening FEN tacked on.
+            fens = continue_with_engine(board, get_move_fn, rng, time_left_ms=time_left_ms)
             result = outcome_to_result(board)
             for fen in fens:
                 f.write(f"{game_id}\t{fen}\t{result}\n")
@@ -108,16 +139,33 @@ def generate_dataset(n_games: int, out_path: str, get_move_fn, seed: int = 0) ->
 
 
 if __name__ == "__main__":
-    # Wire this to your real agent before running at scale:
-    #     import sys; sys.path.insert(0, "../../")  # path to your repo root
-    #     from agent import get_move
-    #     generate_dataset(n_games=2000, out_path="raw_positions.tsv", get_move_fn=get_move)
-    #
-    # Placeholder using random moves on both sides, so the file runs standalone
-    # for a smoke test -- replace before generating your real dataset.
-    def _dummy_get_move(fen: str, time_left_ms: int) -> str:
-        b = chess.Board(fen)
-        return random.choice(list(b.legal_moves)).uci()
+    import argparse
+    from pathlib import Path
 
-    generate_dataset(n_games=20, out_path="raw_positions_smoketest.tsv", get_move_fn=_dummy_get_move)
-    print("wrote raw_positions_smoketest.tsv -- inspect it, then swap in your real agent's get_move")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--games", type=int, default=150)
+    parser.add_argument("--out", default="raw_positions_selfplay.tsv")
+    parser.add_argument("--time-ms", type=int, default=1000,
+                         help="fake clock handed to the real agent for each generated "
+                              "move -- small on purpose, this is bulk data generation, "
+                              "not a real game")
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args()
+
+    repo_root = Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(repo_root))
+    import agent
+
+    def _reset_agent_state() -> None:
+        agent._history.clear()
+        agent._clock.clear()
+
+    generate_dataset(
+        n_games=args.games,
+        out_path=args.out,
+        get_move_fn=agent.get_move,
+        seed=args.seed,
+        time_left_ms=args.time_ms,
+        reset_fn=_reset_agent_state,
+    )
+    print(f"wrote {args.out}")

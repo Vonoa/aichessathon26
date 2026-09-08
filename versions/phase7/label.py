@@ -50,7 +50,7 @@ def label_dataset(
         eval more (faster-converging signal, but re-introduces some engine-
         mimicry risk the more you lean on it -- don't push below ~0.3 without
         a specific reason)."""
-    with open(in_path, "r") as fin, open(out_path, "w") as fout:
+    with open(in_path) as fin, open(out_path, "w") as fout:
         for line in fin:
             line = line.strip()
             if not line:
@@ -63,6 +63,75 @@ def label_dataset(
 
             target = blend_weight_outcome * outcome + (1 - blend_weight_outcome) * eval_component
             fout.write(f"{fen}\t{target:.6f}\n")
+
+
+def make_engine_shallow_eval(budget_s: float = 0.3, clip_cp: float = 3000.0):
+    """The real shallow eval this file's docstring calls for: the current
+    classical engine (main/search.py, diag-8: persistent TT, PVS, aspiration
+    windows, Syzygy), run through its own iterative-deepening loop under a
+    wall-clock budget rather than a fixed depth cap. docs/phase7-nnue.md
+    calls for "depth 6-8, fast, noisy" -- but a raw fixed-depth call on this
+    engine can run away in sharp, wide-open positions (no time bound at all),
+    while a time budget reaches a comparable real depth in ordinary quiet
+    middlegames and stays bounded everywhere, including the sharp ones. Mate
+    scores are clipped to clip_cp before the sigmoid conversion in
+    label_dataset, since an unclipped mate score (+-1,000,000) overflows
+    math.exp there.
+
+    Reaches into search.py's module-level globals (_killers/_hist/_seen) the
+    same way search_move() does, and resets them before every call --
+    labelling calls are on independent positions, so nothing should carry
+    over between them the way search state carries across moves in one game.
+    The persistent transposition table is deliberately NOT reset -- it is a
+    plain cache keyed by position hash, harmless and mildly helpful to leave
+    warm across many independent label() calls in one process.
+    """
+    import sys
+    import time
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[2]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    import search as engine_search
+
+    def _eval(fen: str) -> float:
+        board = chess.Board(fen)
+        legal = list(board.legal_moves)
+        if not legal:
+            return 0.0  # checkmate/stalemate; the outcome label already carries this
+        root_is_white = board.turn == chess.WHITE  # captured before the search can touch
+        # the board -- a _Timeout unwinds through _negamax's recursion without popping
+        # (search.py's own search_move() docstring/comment says so), so board.turn after
+        # the loop can be some mid-tree position's turn, not this FEN's. Reading it only
+        # here, before any push happens, is what search_move() itself does and why.
+
+        engine_search._nodes = 0
+        engine_search._seen = frozenset()
+        engine_search._killers[:] = [None] * len(engine_search._killers)
+        engine_search._hist[:] = [0] * 4096
+
+        deadline = time.monotonic() + budget_s
+        best = legal[0]
+        score = 0
+        alpha, beta = -engine_search.MATE - 1, engine_search.MATE + 1
+        for depth in range(1, 9):  # 8 plies is already deeper than this budget usually reaches
+            try:
+                best, score = engine_search._aspiration_search(
+                    board, depth, deadline, best, alpha, beta
+                )
+            except engine_search._Timeout:
+                break
+            alpha, beta = score - 40, score + 40
+            if time.monotonic() >= deadline or abs(score) >= engine_search._MATE_THRESHOLD:
+                break
+
+        score = max(-clip_cp, min(clip_cp, float(score)))
+        # the search's score is relative to the side to move; sigmoid_to_wdl
+        # expects centipawns from White's POV.
+        return score if root_is_white else -score
+
+    return _eval
 
 
 def make_material_shallow_eval():
@@ -85,13 +154,31 @@ def make_material_shallow_eval():
 
 
 if __name__ == "__main__":
-    import sys
+    import argparse
 
-    if len(sys.argv) != 3:
-        print("usage: python label.py <deduped.tsv> <labelled.tsv>")
-        print("NOTE: uses a material-only placeholder eval -- swap in a real")
-        print("shallow-depth engine call before using this for real training.")
-        sys.exit(1)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("in_path", help="deduped.tsv from dedupe.py")
+    parser.add_argument("out_path", help="where to write labelled.tsv")
+    parser.add_argument(
+        "--blend-weight-outcome", type=float, default=0.3,
+        help="0.3 default = lambda~0.7 on the shallow eval, per docs/phase7-nnue.md "
+             "(and PLAN.md's stated floor of ~0.3 before the mimicry risk needs a "
+             "specific reason to go lower)",
+    )
+    parser.add_argument("--material-only", action="store_true",
+                         help="use the material-only placeholder eval instead of a real "
+                              "shallow search -- for smoke tests only, not real training")
+    parser.add_argument("--budget-s", type=float, default=0.3,
+                         help="wall-clock budget per position for the shallow engine "
+                              "search used as the label's eval-component signal")
+    args = parser.parse_args()
 
-    label_dataset(sys.argv[1], sys.argv[2], make_material_shallow_eval())
-    print(f"wrote {sys.argv[2]}")
+    eval_fn = (
+        make_material_shallow_eval()
+        if args.material_only
+        else make_engine_shallow_eval(budget_s=args.budget_s)
+    )
+    label_dataset(
+        args.in_path, args.out_path, eval_fn, blend_weight_outcome=args.blend_weight_outcome
+    )
+    print(f"wrote {args.out_path}")
