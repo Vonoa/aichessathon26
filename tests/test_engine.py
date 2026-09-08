@@ -82,6 +82,68 @@ def _qsearch_fen(fen: str, ply: int, qply: int = 0) -> int:
     return search._qsearch(bb, state, ply, lo, hi, time.monotonic() + 5, qply)
 
 
+def _code_of(board: chess.Board, uci: str) -> int:
+    import numpy as np
+
+    bb, state = movegen.encode(board)
+    out = np.empty(256, dtype=np.int32)
+    n = movegen._gen_legal(bb, state, out)
+    want = chess.Move.from_uci(uci)
+    for i in range(n):
+        if movegen.decode_move(int(out[i])) == want:
+            return int(out[i])
+    raise AssertionError(uci)
+
+
+def test_see_static_exchange_evaluation() -> None:
+    cases = [
+        ("4k3/8/8/3p4/8/8/8/3RK3 w - - 0 1", "d1d5", 100),      # win an undefended pawn
+        ("4k3/8/2p5/3p4/8/8/8/3RK3 w - - 0 1", "d1d5", -400),   # rook for a defended pawn
+        ("4k3/3r4/8/3r4/8/8/8/3RK3 w - - 0 1", "d1d5", 0),      # RxR, RxR -- level
+        ("3rk3/8/8/3p4/8/8/3R4/3RK3 w - - 0 1", "d2d5", 100),   # x-ray: doubled rooks
+        ("4k3/8/8/2pP4/8/8/8/4K3 w - c6 0 1", "d5c6", 100),     # en passant
+    ]
+    for fen, uci, want in cases:
+        board = chess.Board(fen)
+        turn = 0 if board.turn == chess.WHITE else 1
+        assert movegen._see(movegen.encode(board)[0], turn, _code_of(board, uci)) == want, fen
+
+
+def test_has_non_pawn_material() -> None:
+    bb, _ = movegen.encode(chess.Board())
+    assert search._has_non_pawn_material(bb, 0) and search._has_non_pawn_material(bb, 1)
+    bb, _ = movegen.encode(chess.Board("8/5k2/8/8/8/3K4/4P3/8 w - - 0 1"))  # K+P vs K
+    assert not search._has_non_pawn_material(bb, 0)
+    assert not search._has_non_pawn_material(bb, 1)
+
+
+def test_null_move_pruning_cuts_nodes() -> None:
+    # White is clearly better; a null move still fails high, so NMP prunes.
+    board = chess.Board("r2q1rk1/pp2bppp/2n1bn2/3p4/3P4/2NBPN2/PP3PPP/R2Q1RK1 w - - 0 11")
+    far = time.monotonic() + 120
+    window = (-search.MATE - 1, search.MATE + 1)
+
+    def run(depth: int) -> tuple[int, int]:
+        search._reset_tt()
+        search._killers[:] = [0] * search._KILLER_SLOTS
+        search._hist[:] = [0] * 4096
+        search._tt_gen = (search._tt_gen + 1) & 0xFFFF
+        search._nodes = 0
+        bb, state = movegen.encode(board)
+        _, sc = search._search_root(bb, state, depth, far, 0, *window)
+        return sc, search._nodes
+
+    with_score, with_nodes = run(6)
+    saved = search._NMP_MIN_DEPTH
+    search._NMP_MIN_DEPTH = 99
+    try:
+        without_score, without_nodes = run(6)
+    finally:
+        search._NMP_MIN_DEPTH = saved
+    assert abs(with_score - without_score) <= search._CONTEMPT
+    assert with_nodes < without_nodes
+
+
 def test_seen_position_is_a_draw_at_the_horizon() -> None:
     # A position already seen in the game must score as a draw even at the horizon, not
     # be evaluated by material. With contempt a draw is not exactly 0.

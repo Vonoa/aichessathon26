@@ -339,6 +339,83 @@ def _piece_at(bb: npt.NDArray[np.uint64], colour: int, sq: int) -> int:
     return 0
 
 
+# --- static exchange evaluation -----------------------------------------------------
+
+_SEE_VAL: npt.NDArray[np.int64] = np.array([100, 320, 330, 500, 900, 20_000], dtype=np.int64)
+
+
+@njit(cache=False)
+def _attackers_to(
+    bb: npt.NDArray[np.uint64], sq: int, occ: np.uint64, colour: int
+) -> np.uint64:
+    """Bitboard of `colour`'s pieces attacking `sq` given occupancy `occ` -- x-ray
+    attackers behind a piece that has left during an exchange are revealed."""
+    a = (_KNIGHT_ATK[sq] & bb[colour, 1]) | (_KING_ATK[sq] & bb[colour, 5])
+    pawn_from = _BPAWN_ATK[sq] if colour == 0 else _WPAWN_ATK[sq]
+    a |= pawn_from & bb[colour, 0]
+    a |= _bishop_atk(occ, sq) & (bb[colour, 2] | bb[colour, 4])
+    a |= _rook_atk(occ, sq) & (bb[colour, 3] | bb[colour, 4])
+    return np.uint64(a & occ)
+
+
+@njit(cache=False)
+def _see(bb: npt.NDArray[np.uint64], turn: int, code: int) -> int:
+    """Static exchange evaluation of a capture code: net centipawns on the target square
+    if both sides recapture with their least valuable attacker until one stops. Returns 0
+    for a non-capture; promotions are not modelled."""
+    frm = code & 0x3F
+    to = (code >> 6) & 0x3F
+    flag = (code >> 15) & 7
+    enemy = 1 - turn
+    all_occ = _occ_of(bb, 0) | _occ_of(bb, 1)
+
+    if flag == 2:  # en passant
+        captured = _SEE_VAL[0]
+        ep_sq = to - 8 if turn == 0 else to + 8
+        occ = np.uint64(all_occ & ~_BIT[frm] & ~_BIT[ep_sq])
+    else:
+        vpt = _piece_at(bb, enemy, to)
+        if vpt == 0:
+            return 0
+        captured = _SEE_VAL[vpt - 1]
+        occ = np.uint64(all_occ & ~_BIT[frm])
+
+    on_square = _SEE_VAL[_piece_at(bb, turn, frm) - 1]
+    gains = np.empty(32, dtype=np.int64)
+    gains[0] = captured
+    gi = 1
+    side = enemy
+    while gi < 32:
+        atk = _attackers_to(bb, to, occ, side)
+        if atk == np.uint64(0):
+            break
+        lva_sq = -1
+        lva_val = 1 << 30
+        b = atk
+        while b != np.uint64(0):
+            s = _lsb_sq(b)
+            v = int(_SEE_VAL[_piece_at(bb, side, s) - 1])
+            if v < lva_val:
+                lva_val = v
+                lva_sq = s
+            b &= b - _U1
+        if lva_val == int(_SEE_VAL[5]) and _attackers_to(
+            bb, to, np.uint64(occ & ~_BIT[lva_sq]), 1 - side
+        ) != np.uint64(0):
+            break  # the king may not capture a square the other side still defends
+        gains[gi] = on_square - gains[gi - 1]
+        on_square = lva_val
+        occ = np.uint64(occ & ~_BIT[lva_sq])
+        side = 1 - side
+        gi += 1
+
+    for i in range(gi - 2, -1, -1):
+        take = -int(gains[i])
+        pas = int(gains[i + 1])
+        gains[i] = -(take if take > pas else pas)
+    return int(gains[0])
+
+
 @njit(cache=False)
 def _rook_hop_from(to: int) -> int:
     if to == 6:
@@ -599,6 +676,7 @@ def _warm_up() -> None:
     _gen_legal(bb, state, out)
     _occ3(bb, occ3)
     _zobrist(bb, state)
+    _see(bb, 0, int(out[0]))
     undo = _make(bb, state, out[0])
     _unmake(bb, state, out[0], undo)
 
