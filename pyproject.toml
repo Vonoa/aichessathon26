@@ -37,6 +37,9 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# versions/ holds frozen arena opponents and the offline phase-7 training pipeline --
+# archival / experimental code, not the gated engine. Don't lint it.
+extend-exclude = ["versions"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]

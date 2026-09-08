@@ -239,3 +239,145 @@ definitions live in [docs/PLAN.md](docs/PLAN.md).
 - Golden `"8/2k5/8/8/8/8/5K2/6R1 w"` moved 540 -> 578 (deliberate; only the bare-king
   case changes). Colour symmetry preserved.
 - Gate + arena vs `versions/phase5jit` pending.
+
+### 2026-09-07 — Non-linear king safety (branch `king-safety-nonlinear`)
+
+- The attacker-zone term in `_king_safety_mg` / `_king_safety_side` was linear (`-weight`
+  per enemy piece touching the king's 3x3 zone). Real king danger is roughly quadratic in
+  the number of attackers -- one piece is nothing, three is often decisive. Rated 56 was
+  lost to a Greek-gift sac the eval never flagged (up ~3 pieces of material, eval said
+  -33; a proper king-safety term scores that near -400).
+- New: sum `unit * (zone squares the piece attacks)` over every attacker, count the
+  attackers, then `1 -> -danger`, `2+ -> -min(450, danger^2 * 65 // 100)`. Units
+  P2 N3 B3 R5 Q7. All first-guess constants -- arena calibrates. `ATTACKER_ZONE_WEIGHT`
+  removed, replaced by `KING_ATTACK_UNIT` + `KING_DANGER_SCALE` + `KING_DANGER_MAX`.
+- Reference and jit changed identically; equivalence test holds. Several middlegame golden
+  values re-captured (a deliberate eval rework); the symmetric golden stays 0, the
+  phase-faded endgame goldens are unchanged.
+- Gate + arena vs `versions/phase5jit` pending.
+
+### 2026-09-07 — Endgame king activity (branch `endgame-king-activity`)
+
+- New white-relative eval term `_king_activity` / jitted `_king_activity_jit`, added after
+  the tapered blend alongside the mate driver. Fires only when game phase < 8, one side
+  leads by >= 200 cp (pawn+piece value), and the trailing side is not a bare king (that's
+  the mate driver's job). Rewards the leading side `6 * (7 - Chebyshev(kings))`, faded
+  linearly to 0 at the phase ceiling -- a small tie-breaker that turns aimless shuffling
+  (Rated 57: promoted a queen, drew by threefold with the king wandering) into "march the
+  king toward the enemy to finish".
+- `_material_lead` helper added. Reference and jit changed identically; equivalence test
+  covers new endgame FENs. Zero golden-value changes (the bare-king guard + phase gate +
+  lead gate keep every golden position out of scope).
+- Gate + arena vs `versions/phase5jit` pending.
+
+### 2026-09-08 — Tweaks from the 18-game review (branch `game-review-tweaks`)
+
+Reviewed rounds 43-60 (rounds <= 50 ran older engines; 55-60 are the current one).
+Two failure modes dominate: king-hunt losses (king left in the centre / unsound sac
+accepted) and conversion stalls (won position shuffled to a draw, slow KQ/KR-vs-K mates).
+
+- **Mop-up weights 10/4 -> 16/8.** Rated 58 took ~30 moves to mate KQ-vs-K; the driver's
+  gradient was too shallow at platform depth. Golden `"8/2k5/.../6R1 w"` 578 -> 604.
+- **Flat-position budget cut -- TRIED AND REVERTED.** Cut `_budget_s` by 4x when the last
+  8 completed-search scores were all within +-35 cp. Meant for dead K+R-vs-K+R shuffles
+  (Rated 43 / 60 ran the clock down to 4 s / 10 s) but +-35 for 8 moves also matches a
+  normal balanced middlegame -- in the 10 s + 0.1 s arena it dropped the search to depth
+  1-2 and lost 9 of 16 (Elo -89), with a death-spiral (a timed-out depth-1 move logs
+  score 0, which keeps the cut engaged). A real clock fix needs `fullmove >= ~40`, a
+  tighter band, and a floor -- deferred.
+
+King-in-centre eval term and a position test set from the losses are noted but not done
+here. Next eval work: king defenders + escape squares, rook-on-open-file, outposts.
+
+### 2026-09-08 -- Checks in quiescence + ordered fallback move (branch `qsearch-checks`)
+
+- **Quiet checks in qsearch.** `_qsearch` gains a `qply` counter; for the first
+  `_QS_CHECK_PLIES` (1) plies past the horizon, when not in check, it also generates up
+  to `_QS_CHECK_CAP` (6) non-capturing checking moves alongside the captures/promotions.
+  Purely a chance to raise the score -- a bad check just scores low and is ignored -- so
+  stand-pat stays sound. Catches the forcing shot (knight fork with check, back-rank
+  skewer) a captures-only qsearch walked past. `board.gives_check` is only called on
+  quiet non-promo moves while under the cap and inside the check window, so deeper
+  qnodes pay nothing. New unit test: Nf4+ fork, stand-pat -332 -> qsearch +210.
+- **Ordered fallback move.** `search_move` seeded `best` with `legal[0]` (raw
+  python-chess order); an interrupted first ID pass under severe time pressure then
+  returned a near-random move. Now `best = _ordered(board, legal)[0]` -- MVV-LVA/history
+  order, deterministic, strictly better. Matters in the endgame clock scrambles
+  (Rated 60/61 finished under 13 s).
+- Not expected to fix the Greek-gift losses (R56): the mate there needs a quiet
+  non-check follow-up (Qh5) two plies past the sac -- outside a one-ply check window.
+- Gate + bench (watch the nps hit from `gives_check`) + arena vs `versions/phase5jit`
+  pending.
+
+### 2026-09-08 -- Persistent transposition table (branch `persistent-tt`)
+
+The per-move dict TT is replaced by a fixed-size table kept across moves within a game
+(docs/PLAN.md Phase 4: "fixed-size, replace-by-depth, kept across moves ... not an
+unbounded dict"). A fresh process per game resets it; tests call `search._reset_tt()`.
+
+- Two flat `np.uint64` arrays, `_TT_BITS = 22` -> 4.2M slots, 64 MB, allocated at import,
+  no per-entry Python objects and no GC churn. Open-addressed, one probe at
+  `slot = key64 & mask`; `key64 = hash(_transposition_key()) & 2**64-1` (a tuple of
+  ints/bool/None, so `hash` is stable across runs), 0 reserved for the empty slot.
+- One entry packed per uint64: value (16-bit, offset-encoded), depth (8), flag (2),
+  best-move code (16), generation (16). `_move_code` / `_code_move` round-trip a
+  `chess.Move` through 16 bits (from | to<<6 | promo<<12).
+- Replace-by-depth *within* a generation; a slot from an older search or a different
+  position is always taken. `search_move` bumps `_tt_gen` instead of clearing.
+- `_TT_VALUE_MAX = 30_000`: scores outside +-this are not stored -- they can't fit the
+  field, and this subsumes the "don't cache mate scores" rule (measured from the root,
+  wrong down another path) without a separate check. The in-search-repetition draw is
+  still returned before the store, so it is never cached; a value *derived* from one
+  deeper down is mildly path-dependent but the generation stamp refreshes it within a
+  move or two -- the standard trade-off for a persistent table.
+- Local check: a second search of the same position at fixed depth 4 visits 27 nodes
+  vs 8,594 cold, same score. KR-vs-K depth 6 fills 3,399 slots, none oversized.
+- Tests: entry round-trip, persist-and-cut-nodes, no-oversized-value, `_reset_tt` wipe;
+  `_reset_tt()` added to the autouse fixtures in test_engine.py / test_positions.py and
+  to `test_is_deterministic` (the carried-over table is otherwise a hidden input).
+- Gate + bench (watch for an nps change from the packed probe) + arena vs
+  `versions/phase5jit` pending.
+
+### 2026-09-08 -- Aspiration windows + principal variation search (branch `aspiration`)
+
+Next two items of the Phase 4 pruning stack, on top of the persistent TT.
+
+- **PVS.** In `_search_root` and `_negamax`, the first (PV) move is searched with the
+  full (alpha, beta) window; every later move is scouted with a null window
+  (-alpha-1, -alpha) and only re-searched in full if the scout beats alpha (for a
+  reduced LMR scout, any beat triggers the re-search; for an unreduced one, only a
+  beat strictly below beta). Folds the old separate LMR re-search into the same path.
+- **Aspiration.** `search_move` now drives the root through `_aspiration_search`: for
+  depth > 3 the window is `last_score +- _ASPIRATION` (40 cp). A result outside it
+  widens that side to infinity and re-searches once -- cheap now that the persistent
+  TT carries the tree between the narrow and wide passes.
+- Local checks: mate-in-1 still solved, `get_move` still deterministic, and a
+  fixed-depth root search with the narrow window stays within ~10% of the
+  full-window node count (no blow-up from re-searches).
+- Gate + bench (depth reached in fixed time is the signal) + arena vs
+  `versions/phase5jit` pending. If the bench shows aspiration costing depth on
+  volatile scores, widen `_ASPIRATION` or gate it to deeper plies; PVS stays either way.
+
+### 2026-09-08 -- Syzygy tablebases at the root (branch `syzygy`)
+
+3-man WDL + DTZ Syzygy files ship in `syzygy/` (~26 KB: KP/KQ/KR/KB/KN vs K). When the
+board is down to `_TB_MAX_PIECES` (5) men or fewer and the files are present,
+`search_move` picks the move straight from the tables and skips the search:
+
+- `_tb_root_move`: for each legal move, probe WDL (outcome) and DTZ (plies-to-zero) from
+  our point of view. Rank by best WDL first; among those, when winning: mate-in-1, then a
+  fifty-move-counter-resetting move (capture / pawn push), then smallest DTZ; when losing:
+  drag it out (largest |DTZ|, keep the counter running); a draw just holds.
+- `chess.syzygy.open_tablebase("syzygy")` at import, wrapped so a missing/empty dir or a
+  bad file leaves `_tablebase = None` and nothing changes. Any probe gap (piece count not
+  covered, missing file) makes `_tb_root_move` return None and the search runs as normal.
+- A **first attempt** put a WDL probe inside `_negamax`/`_qsearch`, but that suppressed
+  the search and the 1-ply mop-up gradient just orbited the lone king without mating
+  (KRvK not mated in 40+). Reverted; root-only DTZ selection mates KRvK in 27 plies,
+  KQvK in 11, converts won K+P-vs-K, and correctly holds drawn K+P-vs-K (the Rated
+  61/62 failure mode).
+- **Packaging:** the folder is not auto-detected. Build with
+  `uv run python -m harness.package --include syzygy` or the tables do not ship and the
+  engine silently falls back to search.
+- Gate + arena vs `versions/phase5jit` pending. `make gate` skips the syzygy tests if
+  `search._tablebase is None`.

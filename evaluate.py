@@ -204,20 +204,38 @@ MOBILITY_EG = {chess.KNIGHT: 4, chess.BISHOP: 5, chess.ROOK: 3, chess.QUEEN: 2}
 # KX-vs-K mate driver (centipawns). Only active when one side is a bare king: push the
 # lone king off the centre toward a corner, and march the winning king up to support the
 # mate. Small vs the material lead -- a gradient to convert by, not a material term.
-MOPUP_CENTER_WEIGHT = 10  # per unit of the lone king's centre-manhattan distance (0..6)
-MOPUP_KINGS_WEIGHT = 4  # per unit the winning king is closer than 7 (Chebyshev)
+MOPUP_CENTER_WEIGHT = 16  # per unit of the lone king's centre-manhattan distance (0..6)
+MOPUP_KINGS_WEIGHT = 8  # per unit the winning king is closer than 7 (Chebyshev)
+
+# Endgame king activity (centipawns). Once material is low and one side is clearly ahead,
+# reward the leading side for marching its king toward the enemy king to help finish --
+# phase-faded to 0 in the middlegame (where the king wants safety). Small: a tie-breaker
+# that turns aimless shuffling into progress. The bare-king case is left to the mate
+# driver above.
+KING_ACTIVITY_WEIGHT = 6     # cp per step the leading king is closer than 7 (Chebyshev)
+KING_ACTIVITY_MIN_LEAD = 200  # only when one side leads by at least this (centipawns)
+KING_ACTIVITY_MAX_PHASE = 8   # inactive at or above this game phase
 
 # King safety (centipawns, MG-scale -- faded by phase before being added, see evaluate()).
 SHIELD_PAWN_BONUS = 12
 OPEN_FILE_PENALTY = -22
 SEMI_OPEN_FILE_PENALTY = -12
-ATTACKER_ZONE_WEIGHT = {
+
+# Non-linear king attack: sum `unit * (king-zone squares the piece attacks)` over every
+# enemy piece bearing on the zone, count the attackers, then apply
+#   0 or 1 attacker -> -danger            (a lone piece is easily met)
+#   2+ attackers    -> -min(MAX, danger^2 * SCALE // 100)
+# so danger ramps quadratically with the number of pieces piling on, capped near a rook.
+# All first-guess values -- the arena calibrates them.
+KING_ATTACK_UNIT = {
     chess.PAWN: 2,
-    chess.KNIGHT: 6,
-    chess.BISHOP: 6,
-    chess.ROOK: 9,
-    chess.QUEEN: 14,
+    chess.KNIGHT: 3,
+    chess.BISHOP: 3,
+    chess.ROOK: 5,
+    chess.QUEEN: 7,
 }
+KING_DANGER_SCALE = 65
+KING_DANGER_MAX = 450
 
 _FILE_MASK = [0x0101010101010101 << f for f in range(8)]
 _KING_ZONE: list[int] = [chess.BB_SQUARES[sq] | chess.BB_KING_ATTACKS[sq] for sq in range(64)]
@@ -271,6 +289,44 @@ def _mopup(board: chess.Board) -> int:
     score = MOPUP_CENTER_WEIGHT * _center_manhattan_distance(lone_king)
     score += MOPUP_KINGS_WEIGHT * (7 - chess.square_distance(winning_king, lone_king))
     return -score if loser == chess.WHITE else score
+
+
+def _material_lead(board: chess.Board) -> int:
+    """White pawn+piece value minus Black's, centipawns (kings excluded)."""
+    lead = 0
+    for piece_type in (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN):
+        value = PIECE_VALUES[piece_type]
+        lead += value * chess.popcount(board.pieces_mask(piece_type, chess.WHITE))
+        lead -= value * chess.popcount(board.pieces_mask(piece_type, chess.BLACK))
+    return lead
+
+
+def _king_activity(board: chess.Board) -> int:
+    """White-relative endgame king-activity bonus. 0 at or above KING_ACTIVITY_MAX_PHASE,
+    when the material is roughly level, or when the trailing side is a bare king (the mate
+    driver owns that). Otherwise: reward the leading side for closing its king on the
+    enemy king, faded linearly to 0 at the phase ceiling.
+    """
+    phase = _game_phase(board)
+    if phase >= KING_ACTIVITY_MAX_PHASE:
+        return 0
+    lead = _material_lead(board)
+    if abs(lead) < KING_ACTIVITY_MIN_LEAD:
+        return 0
+    ahead = chess.WHITE if lead > 0 else chess.BLACK
+    behind = not ahead
+    behind_occ = board.occupied_co[behind]
+    if behind_occ == board.kings & behind_occ:  # bare king -- _mopup's domain
+        return 0
+    ahead_king = board.king(ahead)
+    enemy_king = board.king(behind)
+    if ahead_king is None or enemy_king is None:
+        return 0
+
+    proximity = 7 - chess.square_distance(ahead_king, enemy_king)  # 0..6
+    bonus = KING_ACTIVITY_WEIGHT * proximity * (KING_ACTIVITY_MAX_PHASE - phase)
+    bonus //= KING_ACTIVITY_MAX_PHASE
+    return bonus if ahead == chess.WHITE else -bonus
 
 
 def _game_phase(board: chess.Board) -> int:
@@ -362,10 +418,18 @@ def _king_safety_mg(board: chess.Board, king_sq: int, color: bool, white: int, b
 
     zone = _KING_ZONE[king_sq]
     enemy_color = not color
-    for piece_type, weight in ATTACKER_ZONE_WEIGHT.items():
+    danger = 0
+    attackers = 0
+    for piece_type, unit in KING_ATTACK_UNIT.items():
         for sq in chess.scan_forward(board.pieces_mask(piece_type, enemy_color)):
-            if board.attacks_mask(sq) & zone:
-                score -= weight
+            hits = (board.attacks_mask(sq) & zone).bit_count()
+            if hits:
+                attackers += 1
+                danger += unit * hits
+    if attackers >= 2:
+        score -= min(KING_DANGER_MAX, danger * danger * KING_DANGER_SCALE // 100)
+    else:
+        score -= danger
 
     return score
 
@@ -654,10 +718,10 @@ _MOBILITY_EG_ARR: npt.NDArray[np.int16] = np.array(
     [0, MOBILITY_EG[chess.KNIGHT], MOBILITY_EG[chess.BISHOP],
      MOBILITY_EG[chess.ROOK], MOBILITY_EG[chess.QUEEN], 0], dtype=np.int16,
 )
-_ATTACKER_WEIGHT_ARR: npt.NDArray[np.int16] = np.array(
-    [ATTACKER_ZONE_WEIGHT[chess.PAWN], ATTACKER_ZONE_WEIGHT[chess.KNIGHT],
-     ATTACKER_ZONE_WEIGHT[chess.BISHOP], ATTACKER_ZONE_WEIGHT[chess.ROOK],
-     ATTACKER_ZONE_WEIGHT[chess.QUEEN], 0], dtype=np.int16,
+_KING_ATTACK_UNIT_ARR: npt.NDArray[np.int16] = np.array(
+    [KING_ATTACK_UNIT[chess.PAWN], KING_ATTACK_UNIT[chess.KNIGHT],
+     KING_ATTACK_UNIT[chess.BISHOP], KING_ATTACK_UNIT[chess.ROOK],
+     KING_ATTACK_UNIT[chess.QUEEN], 0], dtype=np.int16,
 )
 _KING_ZONE_ARR: npt.NDArray[np.uint64] = np.array(_KING_ZONE, dtype=np.uint64)
 # Shield / pawn-attack tables in this file's colour order: index 0 = White, 1 = Black.
@@ -747,8 +811,10 @@ def _king_safety_side(
             score += SEMI_OPEN_FILE_PENALTY
 
     zone = _KING_ZONE_ARR[king_sq]
+    danger = 0
+    attackers = 0
     for pt in range(5):  # PAWN, KNIGHT, BISHOP, ROOK, QUEEN
-        weight = int(_ATTACKER_WEIGHT_ARR[pt])
+        unit = int(_KING_ATTACK_UNIT_ARR[pt])
         bb = pieces[enemy, pt]
         while bb != np.uint64(0):
             lsb = bb & (~bb + np.uint64(1))
@@ -756,9 +822,18 @@ def _king_safety_side(
             # both branches are uint64, so the ternary is numba-safe here (unlike a
             # ternary that mixes an int with a promoted-to-float shift result)
             att = _PAWN_ATTACKS_ARR[enemy, sq] if pt == 0 else _piece_attacks(occ_all, sq, pt)
-            if (att & zone) != np.uint64(0):
-                score -= weight
+            hits = int(_popcount(att & zone))
+            if hits > 0:
+                attackers += 1
+                danger += unit * hits
             bb &= bb - np.uint64(1)
+    if attackers >= 2:
+        penalty = danger * danger * KING_DANGER_SCALE // 100
+        if penalty > KING_DANGER_MAX:
+            penalty = KING_DANGER_MAX
+        score -= penalty
+    else:
+        score -= danger
 
     return int(score)
 
@@ -822,6 +897,47 @@ def _mopup_jit(
 
 
 @njit(cache=False)
+def _king_activity_jit(
+    occ: npt.NDArray[np.uint64],
+    pieces: npt.NDArray[np.uint64],
+    white_king: int,
+    black_king: int,
+) -> int:
+    """White-relative endgame king-activity bonus. Mirrors evaluate._king_activity."""
+    phase = _game_phase_jit(pieces)
+    if phase >= KING_ACTIVITY_MAX_PHASE:
+        return 0
+    lead = 0
+    for pt in range(5):  # pawn, knight, bishop, rook, queen
+        value = int(_PIECE_VALUE_ARR[pt])
+        lead += value * int(_popcount(pieces[0, pt]))
+        lead -= value * int(_popcount(pieces[1, pt]))
+    if lead >= KING_ACTIVITY_MIN_LEAD:
+        ahead_king = white_king
+        enemy_king = black_king
+        white_ahead = True
+    elif lead <= -KING_ACTIVITY_MIN_LEAD:
+        ahead_king = black_king
+        enemy_king = white_king
+        white_ahead = False
+    else:
+        return 0
+    # The trailing side a bare king -> _mopup_jit's domain, not this term's.
+    behind_bare = occ[1] == pieces[1, 5] if white_ahead else occ[0] == pieces[0, 5]
+    if behind_bare:
+        return 0
+
+    af = ahead_king & 7
+    ar = ahead_king >> 3
+    ef = enemy_king & 7
+    er = enemy_king >> 3
+    proximity = 7 - max(abs(af - ef), abs(ar - er))
+    bonus = KING_ACTIVITY_WEIGHT * proximity * (KING_ACTIVITY_MAX_PHASE - phase)
+    bonus //= KING_ACTIVITY_MAX_PHASE
+    return bonus if white_ahead else -bonus
+
+
+@njit(cache=False)
 def _evaluate_jit(
     pieces: npt.NDArray[np.uint64],
     occ: npt.NDArray[np.uint64],
@@ -843,7 +959,11 @@ def _evaluate_jit(
     mg_total = material_mg + pawn + mob_mg + king_safety
     eg_total = material_eg + pawn + mob_eg
     blended = mg_total * phase + eg_total * (24 - phase)
-    tapered = int(blended / 24) + _mopup_jit(occ, pieces, white_king, black_king)
+    tapered = (
+        int(blended / 24)
+        + _mopup_jit(occ, pieces, white_king, black_king)
+        + _king_activity_jit(occ, pieces, white_king, black_king)
+    )
     if white_to_move:
         return tapered
     return -tapered
@@ -864,6 +984,7 @@ def _warm_up() -> None:
     _mobility_jit(pieces, occ)
     _king_safety_jit(pieces, occ, 4, 60)  # e1 / e8 kings of the start position
     _mopup_jit(occ, pieces, 4, 60)
+    _king_activity_jit(occ, pieces, 4, 60)
     _evaluate_jit(pieces, occ, 4, 60, True)
 
 
@@ -919,7 +1040,7 @@ def _evaluate_reference(board: chess.Board) -> int:
     # int() truncates toward zero so the score stays exactly colour-symmetric; // would
     # round toward negative infinity and make a position and its mirror differ by 1.
     blended = mg_score * phase + eg_score * (TOTAL_PHASE - phase)
-    tapered = int(blended / TOTAL_PHASE) + _mopup(board)
+    tapered = int(blended / TOTAL_PHASE) + _mopup(board) + _king_activity(board)
 
     return tapered if board.turn == chess.WHITE else -tapered
 

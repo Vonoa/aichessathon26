@@ -10,7 +10,7 @@ from search import search_move
 
 # Bump this on every upload. It prints once at import, so the per-game log the platform
 # keeps names exactly which build played that game.
-BUILD = "diag-2 + KX-vs-K mate driver"
+BUILD = "diag-8 persistent-TT + PVS/aspiration + syzygy 3-man"
 print(f"agent build: {BUILD}", flush=True)
 
 # Import time runs once per game, inside a 90 second budget, before your clock starts.
