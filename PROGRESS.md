@@ -269,3 +269,22 @@ definitions live in [docs/PLAN.md](docs/PLAN.md).
   covers new endgame FENs. Zero golden-value changes (the bare-king guard + phase gate +
   lead gate keep every golden position out of scope).
 - Gate + arena vs `versions/phase5jit` pending.
+
+### 2026-09-08 — Tweaks from the 18-game review (branch `game-review-tweaks`)
+
+Reviewed rounds 43-60 (rounds <= 50 ran older engines; 55-60 are the current one).
+Two failure modes dominate: king-hunt losses (king left in the centre / unsound sac
+accepted) and conversion stalls (won position shuffled to a draw, slow KQ/KR-vs-K mates).
+
+- **Mop-up weights 10/4 -> 16/8.** Rated 58 took ~30 moves to mate KQ-vs-K; the driver's
+  gradient was too shallow at platform depth. Golden `"8/2k5/.../6R1 w"` 578 -> 604.
+- **Flat-position budget cut -- TRIED AND REVERTED.** Cut `_budget_s` by 4x when the last
+  8 completed-search scores were all within +-35 cp. Meant for dead K+R-vs-K+R shuffles
+  (Rated 43 / 60 ran the clock down to 4 s / 10 s) but +-35 for 8 moves also matches a
+  normal balanced middlegame -- in the 10 s + 0.1 s arena it dropped the search to depth
+  1-2 and lost 9 of 16 (Elo -89), with a death-spiral (a timed-out depth-1 move logs
+  score 0, which keeps the cut engaged). A real clock fix needs `fullmove >= ~40`, a
+  tighter band, and a floor -- deferred.
+
+King-in-centre eval term and a position test set from the losses are noted but not done
+here. Next eval work: king defenders + escape squares, rook-on-open-file, outposts.
