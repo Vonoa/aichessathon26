@@ -22,35 +22,42 @@ Key numbers (verify against the site before relying on them):
   `onnxruntime` 1.29, `numba` 0.67. A `requirements.txt` in the zip is ignored.
 - 10 uploads per team per day; the latest one that passed validation plays.
 
-## Status (2026-09-08, build `diag-8`)
+## Status (2026-09-08, build `diag-9`)
 
-Phases 1-4 and 6 are shipped. The engine is a jitted-eval negamax with the full
-classical pruning stack and 3-man Syzygy:
+Phases 1-6 are shipped. The engine is a **numba-jitted bitboard engine** -- jitted move
+generator, make/unmake and evaluation -- with the full classical pruning stack and 3-man
+Syzygy. See `docs/ENGINE.md` for how each piece works.
 
-- **Search:** negamax + fail-soft alpha-beta, iterative deepening, **principal variation
-  search**, **aspiration windows** (±40 cp around the last score), quiescence with
-  captures + promotions + one ply of quiet checks, MVV-LVA + killers + history ordering,
-  check extension, late-move reductions, contempt (25 cp), mate-distance scoring.
-- **Transposition table:** persistent, fixed-size (2 x 4.2 M `uint64`, ~64 MB), packed
-  one entry per word, replace-by-depth with a per-search generation stamp. Kept across
-  moves within a game. This is the single biggest gain so far (~2.4x nps, +1 ply).
-- **Evaluation:** numba-jitted tapered PST + material + pawn structure + mobility +
-  non-linear (quadratic) king safety + KX-vs-K mop-up driver + endgame king activity.
-- **Endgame:** 3-man Syzygy WDL+DTZ (`syzygy/`, ~26 KB). At <=5 men and the files
-  present, `search_move` returns the tablebase move (WDL then DTZ) and skips the search.
-  Package with `--include syzygy` or it does not ship.
-- **Reached on the match machine:** d5-d7 middlegame, ~20-28k nps.
+- **Board:** `movegen.py` -- `(bb, state)` numpy arrays, jitted `_gen_legal` / `_make` /
+  `_unmake`, `_zobrist` keys, `_see`. A `chess.Board` is touched only at the root. Perft
+  matches the published numbers to depth 5 and python-chess's move sets over 21k
+  positions; the wired search matched the old one's score on 561/562 positions.
+- **Search:** negamax + fail-soft alpha-beta, iterative deepening, PVS, aspiration
+  windows (±40 cp), **null-move pruning**, late-move reductions, **SEE** quiescence
+  filter, quiescence with a ply of quiet checks, MVV-LVA + killers + history ordering,
+  check extension, contempt (25 cp), mate-distance scoring.
+- **Transposition table:** persistent, fixed-size (2 x 4.2 M `uint64`, ~64 MB),
+  replace-by-depth + generation stamp, kept across moves within a game.
+- **Evaluation:** jitted tapered PST + material + pawn structure + mobility + non-linear
+  (quadratic) king safety + KX-vs-K mop-up driver + endgame king activity.
+- **Endgame:** 3-man Syzygy WDL+DTZ (`syzygy/`, ~26 KB); at <=5 men `search_move` returns
+  the tablebase move and skips the search. Package with `--include syzygy` / `make zip`.
+- **Reached on the match machine:** d6-d8 middlegame, ~48k nps (was d4-d6, ~25k at diag-8;
+  d3-d2 and ~8k before the jitted eval).
+- **Progression on the mirror arena vs `versions/phase5jit`:** persistent TT ~+0 (noise),
+  ... , jitted movegen +66 Elo, movegen + SEE + NMP **+163 Elo (+45..+335)** -- the first
+  change to clear zero on 16 games.
 
 Two open fronts:
 
-1. **Depth in sharp middlegames.** Rated losses (R56, R59, R63, R67) share a shape:
-   equal opening -> one tactical/positional sequence the d5-d6 search does not see ->
-   lost -> mated. The jitted move generator is the headline fix; the section below is
-   the alternative path.
-2. **NNUE** (`docs/phase7-nnue.md`) -- teammate's offline track, not competitive yet.
+1. **Finish the pruning stack.** Reverse-futility, futility, late-move (move-count)
+   pruning, adaptive time management -- all cheap on the jitted substrate. Then Texel-tune
+   the evaluation weights (still all hand-picked placeholders).
+2. **NNUE** (`docs/phase7-nnue.md`) -- teammate's offline track. Can now rebase its search
+   onto `main` and inherit the jitted movegen.
 
-Not a current problem: endgame conversion at <=3 men (Syzygy fixed it); the clock
-(`diag-8` finishes rated games with 60 s+).
+Not a current problem: endgame conversion at <=3 men (Syzygy); the clock (finishes rated
+games with 60 s+); raw speed (the movegen closed it).
 
 ## Rules on AI (from aichessathon.com/docs/rules.md)
 
@@ -100,30 +107,37 @@ never raise. Split into `agent.py` (entrypoint + fallback), `search.py`, `evalua
 - A move-1 nodes/sec assertion in the tests, to catch numba compiling on the clock later.
 - **Done when:** 300+ games vs `random` and vs `greedy` with zero crash / flag / illegal.
 
-### Phase 3 — speed  *(eval done; movegen open)*
+### Phase 3 — speed  *(done)*
 
-- **Done:** numba-jitted evaluation, warmed at import (~3x nps, +1 ply). Golden +
-  equivalence tests pin the jitted path against a pure-Python reference.
-- **Open:** the **jitted bitboard move generator**. `board.legal_moves` + `board.push` /
-  `pop` + `board.is_check` are the per-node cost now that eval is jitted. This is the
-  hardest single item and the one that separates the field. Deferred while the pruning
-  stack and Syzygy were landed; see "Depth without the jitted movegen" below for the
-  cheaper alternatives to try first.
+- **Jitted evaluation**, warmed at import (~3x nps). Golden + equivalence tests pin it
+  against a pure-Python reference.
+- **Jitted bitboard move generator** (`movegen.py`) -- the hardest single item and the
+  one that separates the field. Built and perft-validated on its own (Phase A), then the
+  search rewritten onto `(bb, state)` with jitted make/unmake, `_zobrist` keys and check
+  detection, `chess.Board` only at the root (Phase B). Another ~2.4x nps, +1-2 ply. Every
+  sub-step validated: eval bridge == `evaluate.evaluate` (8,432 positions), search score
+  == the old python-chess search on 561/562 positions.
 
 ### Phase 4 — the pruning stack  *(done)*
 
 All shipped and arena/ladder-checked one at a time:
 
 - Persistent fixed-size TT (packed `uint64` arrays, replace-by-depth + generation, kept
-  across moves). The big win: ~2.4x nps, +1 ply.
-- Quiescence: captures + promotions + one ply of quiet checks. (Delta pruning: not yet.)
+  across moves). ~2.4x nps, +1 ply.
+- Quiescence: captures + promotions + one ply of quiet checks + an SEE losing-capture
+  filter. (Delta pruning: not yet.)
 - Principal variation search + aspiration windows.
 - Killer-move and history heuristics.
 - Late-move reductions.
 - Check extensions.
-- **Null-move pruning: tried at d3-d4, lost 83 Elo, reverted** — needs depth to pay.
-  Worth re-trying now that the engine reaches d5-d7 (see below).
-- SEE: not yet — see below.
+- **Null-move pruning.** Reverted at d3-d4 (-83 Elo, "needs depth to pay"); re-added on
+  the jitted substrate with a `static eval >= beta` gate -- takes the rook endgame bench
+  d8 -> d10 at no nps cost.
+- **SEE** (`movegen._see`, jitted, x-ray) -- quiescence drops `SEE < -90` captures unless
+  equal-or-up or giving check.
+
+  movegen + SEE + NMP together: arena +163 Elo vs `versions/phase5jit` (+45..+335), the
+  first change to clear zero on 16 games.
 
 ### Phase 5 — evaluation  *(partly done; Texel tuning open)*
 
@@ -150,48 +164,36 @@ on 3,875 positions, per-node ONNX inference, search forked from an old build. Th
 gap analysis and the plan to close it are in **`docs/phase7-nnue.md`**. Ships only if it
 clearly beats the classical `main` in a 100+ game arena.
 
-## Depth without the jitted movegen
+## Next: the rest of the pruning stack
 
-The movegen rewrite is the biggest single depth lever but it is also the riskiest,
-multi-day item. These add roughly the same effective depth (~1.5-2.5 ply combined) for a
-fraction of the risk, and each is independent. Ship one per branch as its own `diag-N`
-so the rated ladder can attribute it — the mirror arena (`versions/phase5jit`) cannot
-measure changes this size.
+The jitted movegen (Phase 3) is done, and SEE + NMP landed on top of it. These remaining
+items are cheap on the fast substrate (they are eval-comparisons, no attack computation)
+and each is independent. Ship one per branch as its own `diag-N` so the rated ladder can
+attribute it -- the mirror arena straddles zero on changes this size.
 
-Ranked by value / effort:
+1. **Reverse futility / static null-move pruning.** At shallow depth, if
+   `static_eval - margin(depth) >= beta`, return without searching. ~5 lines, ~+20-30 Elo.
 
-1. **SEE (static exchange evaluation).** ~40-60 lines of pure Python off
-   `board.attackers_mask`. Two uses: (a) in quiescence, skip captures with `SEE < 0` --
-   qsearch is a large fraction of all nodes and it currently searches every capture
-   including `QxP`-defended; (b) order captures by SEE instead of MVV-LVA. Also lets us
-   reduce / skip bad captures in the main search. The single biggest non-movegen lever.
-
-2. **Null-move pruning, retry.** Not in check, opponent gets a free move, search
-   `depth - 1 - R` (R ~= 2-3); if it still fails high, prune the node. Reverted at d3-d4
-   (-83 Elo, "needs depth to pay"); the engine is at d5-d7 now. Guard with the
-   `_has_non_pawn_material` helper (already in the file) against zugzwang, and never in
-   the PV or in check. Standard +50-80 Elo when it works.
-
-3. **Reverse futility / static null-move pruning.** At shallow depth, if
-   `static_eval - margin(depth) >= beta`, return `static_eval` without searching. Very
-   cheap, ~+20-30 Elo.
-
-4. **Futility pruning.** At frontier nodes (depth 1-2), skip quiet moves when
+2. **Futility pruning.** At frontier nodes (depth 1-2), skip quiet moves when
    `static_eval + margin < alpha` -- they cannot raise alpha. Conservative margins keep
    it safe. ~+20-40 Elo.
 
-5. **Late-move pruning (move-count).** Near the leaves (depth <= 3-4), once the first
-   `3 + depth*depth` quiet moves have not improved alpha, skip the rest outright (not
-   just reduce). Not in check, not the PV. ~+20-40 Elo.
+3. **Late-move pruning (move-count).** Near the leaves (depth <= 3-4), once the first
+   `3 + depth*depth` quiet moves have not improved alpha, skip the rest outright. Not in
+   check, not the PV. ~+20-40 Elo.
 
-6. **LMR formula.** Replace the `r = 1 or 2` step with `r ~= 0.8 + ln(depth)*ln(move)/2.3`,
+4. **LMR formula.** Replace the `r = 1 or 2` step with `r ~= 0.8 + ln(depth)*ln(move)/2.3`,
    less on PV / killers / when improving, more for very late moves and bad captures.
    ~+20-50 Elo, medium effort.
 
-7. **Adaptive time.** `_budget_s` is flat per move. Spend more when the best move changed
+5. **Adaptive time.** `_budget_s` is flat per move. Spend more when the best move changed
    between iterations or the position is sharp (many captures / checks / a big eval
-   swing), less on forced recaptures and quiet positions -- depth where it decides games.
-   ~+20-40 Elo.
+   swing), less on forced recaptures and quiet positions. ~+20-40 Elo.
+
+6. **Texel-tune the evaluation.** Every weight in `evaluate.py` is a hand-picked
+   placeholder. Play a few hundred thousand self-play positions (fast now), label with
+   the game result blended with a shallow eval, fit by logistic regression. The
+   teammate's NNUE data pipeline is ~90% reusable. ~+30-80 Elo, completes Phase 5.
 
 8. **TT polish.** Store the static eval in the entry (skip re-evaluating on revisit);
    bucketed slots (2-4 entries per index, depth-preferred + always-replace) to cut
@@ -212,9 +214,9 @@ median entry looks the same: `board.legal_moves` in the loop, a dict TT on
 | Crowd does | Why it's weak | Our move | Status |
 |---|---|---|---|
 | python-chess board as the search node | it's a correctness library, not a speed one | jitted bitboard movegen | **open** — the last big lever |
-| unbounded dict TT | GC churn, eats the 2 GB | fixed `uint64`-array table, replace-by-depth + generation | done (`diag-8`) |
+| unbounded dict TT | GC churn, eats the 2 GB | fixed `uint64`-array table, replace-by-depth + generation | done |
 | `random.choice` tie-break | non-deterministic → can't reproduce or explain a game | seed + deterministic tie-break | done |
-| ordering stops at MVV-LVA | alpha-beta underperforms on quiet moves | killers + history (done); SEE | SEE open |
+| ordering stops at MVV-LVA | alpha-beta underperforms on quiet moves | killers + history + SEE (x-ray, jitted) | done |
 | re-scan `board.pieces()` every node | O(64) + dict alloc per node | jitted bitboard eval reading colour-masked piece bitboards | done |
 | test with 2–20 games | pure noise | rated ladder as the real signal; 16-game arena only as a "did it crater" check | done |
 | numba warm-up with the wrong dtype | recompiles on move 1 → flag | warm with the exact signature at import | done |
