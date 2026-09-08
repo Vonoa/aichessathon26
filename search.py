@@ -32,6 +32,8 @@ import time
 from collections.abc import Hashable
 
 import chess
+import numpy as np
+import numpy.typing as npt
 
 from evaluate import evaluate
 
@@ -46,7 +48,6 @@ _QS_CHECK_PLIES = 1  # follow non-capturing checks this many plies past the hori
 _QS_CHECK_CAP = 6  # at most this many quiet checking moves added per quiescence node
 
 _EXACT, _LOWER, _UPPER = 0, 1, 2  # transposition-table bound kinds
-_TT_MAX = 1_000_000  # entries; clear rather than grow past this
 _LMR_MIN_DEPTH = 3  # only reduce late moves with this much depth left
 _LMR_MIN_MOVE = 3  # first this many moves at each node are searched at full depth
 
@@ -62,9 +63,55 @@ _DEBUG = os.environ.get("AGENT_DEBUG") == "1"
 _nodes = 0
 _last_depth = 0  # deepest fully completed pass of the last search; read by tools/bench.py
 _seen: frozenset[Hashable] = frozenset()
-_tt: dict[Hashable, tuple[int, int, int, chess.Move | None]] = {}
 _killers: list[chess.Move | None] = [None] * _KILLER_SLOTS  # two per ply, flat: ply*2, ply*2+1
 _hist: list[int] = [0] * 4096  # quiet-move cutoff counts, indexed from_square*64 + to_square
+
+# Transposition table. Fixed-size and kept across moves within a game -- a fresh process
+# per game resets it for free; tests call _reset_tt(). Two flat uint64 arrays, no
+# per-entry Python objects: an unbounded dict here churns GC and eats the 2 GB budget
+# (docs/PLAN.md, Phase 4). Open-addressed, one probe at slot = key & mask.
+_TT_BITS = 22
+_TT_SIZE = 1 << _TT_BITS  # 4,194,304 slots; 64 MB for the pair of arrays
+_TT_MASK = _TT_SIZE - 1
+_TT_VALUE_MAX = 30_000  # values outside +-this are not stored: they cannot fit the 16-bit
+#                         field and a real evaluate() score never comes near it anyway.
+#                         This also excludes mate scores (measured from the root, wrong
+#                         down another path) without a separate check.
+_tt_key: npt.NDArray[np.uint64] = np.zeros(_TT_SIZE, dtype=np.uint64)  # 0 == empty slot
+_tt_data: npt.NDArray[np.uint64] = np.zeros(_TT_SIZE, dtype=np.uint64)
+_tt_gen = 0  # bumped per search; a slot from an older generation is always replaceable
+
+# _tt_data packs one entry into 64 bits:
+#   bits  0-15  value, offset-encoded (value + 0x8000) so negatives round-trip
+#   bits 16-23  depth (0..255; mate scores are never stored, so 16 bits of value is plenty)
+#   bits 24-25  bound flag (_EXACT / _LOWER / _UPPER)
+#   bits 26-41  best-move code: from | to << 6 | promo << 12  (0 == no move)
+#   bits 42-57  generation, low 16 bits
+_PROMO_CODE = {None: 0, chess.KNIGHT: 1, chess.BISHOP: 2, chess.ROOK: 3, chess.QUEEN: 4}
+_CODE_PROMO: tuple[int | None, ...] = (None, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN)
+
+
+def _move_code(move: chess.Move | None) -> int:
+    if move is None:
+        return 0
+    return move.from_square | (move.to_square << 6) | (_PROMO_CODE[move.promotion] << 12)
+
+
+def _code_move(code: int) -> chess.Move | None:
+    if code == 0:
+        return None
+    return chess.Move(code & 0x3F, (code >> 6) & 0x3F, _CODE_PROMO[(code >> 12) & 0x7])
+
+
+def _reset_tt() -> None:
+    """Wipe the table. The engine never calls this -- a game is one process and the table
+    is meant to live the whole game. Tests that play several positions in one process do,
+    the same way they reset agent._history / agent._clock.
+    """
+    global _tt_gen
+    _tt_key.fill(0)
+    _tt_data.fill(0)
+    _tt_gen = 0
 
 
 class _Timeout(Exception):
@@ -83,11 +130,11 @@ def search_move(
     so whenever the budget runs out there is always a finished answer to return, and that
     move is tried first on the next, deeper pass.
     """
-    global _nodes, _seen, _last_depth
+    global _nodes, _seen, _last_depth, _tt_gen
     _nodes = 0
     _last_depth = 0
     _seen = frozenset(history) if history else frozenset()
-    _tt.clear()
+    _tt_gen = (_tt_gen + 1) & 0xFFFF  # keep the table; mark this search's entries fresh
     _killers[:] = [None] * _KILLER_SLOTS
     _hist[:] = [0] * 4096
 
@@ -196,19 +243,24 @@ def _negamax(
     # A repetition or an already-seen position is a draw even when it lands exactly on the
     # horizon, so this must run before the depth<=0 leaf return. The key is only computed
     # once halfmove_clock makes a repetition possible, so quiet leaves still skip it.
-    key = board._transposition_key() if board.halfmove_clock >= 4 else None
-    if key is not None and (board.is_repetition(2) or key in _seen):
+    tkey = board._transposition_key() if board.halfmove_clock >= 4 else None
+    if tkey is not None and (board.is_repetition(2) or tkey in _seen):
         return _draw_score(ply)
     if depth <= 0:
         return _qsearch(board, ply, alpha, beta, deadline)
 
-    if key is None:
-        key = board._transposition_key()
+    if tkey is None:
+        tkey = board._transposition_key()
+    key64 = hash(tkey) & 0xFFFFFFFFFFFFFFFF or 1  # 0 is the empty-slot marker
+    slot = key64 & _TT_MASK
     tt_move: chess.Move | None = None
-    entry = _tt.get(key)
-    if entry is not None:
-        e_depth, e_value, e_flag, tt_move = entry
+    if int(_tt_key[slot]) == key64:
+        data = int(_tt_data[slot])
+        e_depth = (data >> 16) & 0xFF
+        e_flag = (data >> 24) & 0x3
+        tt_move = _code_move((data >> 26) & 0xFFFF)
         if e_depth >= depth:
+            e_value = (data & 0xFFFF) - 0x8000
             if e_flag == _EXACT:
                 return e_value
             if e_flag == _LOWER and e_value >= beta:
@@ -255,19 +307,34 @@ def _negamax(
                 _record_cutoff(move, ply, depth)
             break
 
-    # Do not cache mate scores: ours are measured from the root, so they are wrong down a
-    # different path. (A 0 from an in-search repetition is path-dependent too, but harmless
-    # while the table is cleared every move; revisit when the Phase 4 table persists.)
-    if abs(value) < _MATE_THRESHOLD:
+    # Mate scores are not stored (see _TT_VALUE_MAX): measured from the root, they are
+    # wrong down a different path. A 0 from an in-search repetition is mildly
+    # path-dependent too, but the generation stamp below refreshes such entries within a
+    # move or two and contempt keeps the error to +-_CONTEMPT -- a standard trade-off for
+    # a persistent table.
+    if abs(value) < _TT_VALUE_MAX:
         if value <= alpha_orig:
             flag = _UPPER
         elif value >= beta:
             flag = _LOWER
         else:
             flag = _EXACT
-        if len(_tt) >= _TT_MAX:
-            _tt.clear()
-        _tt[key] = (depth, value, flag, best_move)
+        prev = int(_tt_data[slot])
+        # Replace unless the slot already holds a deeper result for THIS position from
+        # THIS search; a stale-generation or different-position slot is always taken.
+        if (
+            int(_tt_key[slot]) != key64
+            or ((prev >> 42) & 0xFFFF) != _tt_gen
+            or ((prev >> 16) & 0xFF) <= depth
+        ):
+            _tt_key[slot] = key64
+            _tt_data[slot] = (
+                ((value + 0x8000) & 0xFFFF)
+                | (min(depth, 255) << 16)
+                | (flag << 24)
+                | (_move_code(best_move) << 26)
+                | ((_tt_gen & 0xFFFF) << 42)
+            )
     return value
 
 

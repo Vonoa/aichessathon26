@@ -17,9 +17,11 @@ import search
 def _reset_state():
     agent._history.clear()
     agent._clock.clear()
+    search._reset_tt()  # the table lives for a game; a test is a fresh "game"
     yield
     agent._history.clear()
     agent._clock.clear()
+    search._reset_tt()
 
 
 def test_finds_mate_in_one() -> None:
@@ -61,6 +63,7 @@ def test_is_deterministic() -> None:
     first = agent.get_move(fen, 2000)
     agent._history.clear()
     agent._clock.clear()
+    search._reset_tt()  # the carried-over table is a hidden input; wipe it to isolate
     second = agent.get_move(fen, 2000)
     assert first == second
 
@@ -107,6 +110,81 @@ def test_qsearch_follows_a_quiet_check_to_win_material() -> None:
     # With the check window exhausted (qply past _QS_CHECK_PLIES) it reverts to stand-pat.
     no_checks = search._qsearch(board, 1, -search.MATE - 1, search.MATE + 1, deadline, 9)
     assert no_checks == stand_pat
+
+
+def test_tt_entry_round_trips() -> None:
+    # Pack the same fields the store path packs, unpack them the way the probe does.
+    cases = [
+        (0, 1, search._EXACT, None),
+        (-29_999, 64, search._UPPER, chess.Move.from_uci("e2e4")),
+        (29_999, 255, search._LOWER, chess.Move.from_uci("e7e8q")),
+        (-1, 5, search._EXACT, chess.Move.from_uci("a7b8n")),
+    ]
+    for value, depth, flag, move in cases:
+        data = (
+            ((value + 0x8000) & 0xFFFF)
+            | (min(depth, 255) << 16)
+            | (flag << 24)
+            | (search._move_code(move) << 26)
+            | ((123 & 0xFFFF) << 42)
+        )
+        assert (data & 0xFFFF) - 0x8000 == value
+        assert (data >> 16) & 0xFF == depth
+        assert (data >> 24) & 0x3 == flag
+        assert search._code_move((data >> 26) & 0xFFFF) == move
+        assert (data >> 42) & 0xFFFF == 123
+
+
+def test_tt_persists_across_moves_and_cuts_nodes() -> None:
+    # Two searches of the same position at a fixed depth with no deadline, the way two
+    # moves of a game hit the same transposition. The second keeps the first's entries
+    # (only the generation stamp advances) and must reach the same score for far fewer
+    # nodes. The move can differ between equal-scored choices, so don't assert on it.
+    board = chess.Board("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3")
+    far = time.monotonic() + 120
+    first_move = next(iter(board.legal_moves))
+    search._killers[:] = [None] * search._KILLER_SLOTS
+    search._hist[:] = [0] * 4096
+
+    search._tt_gen = (search._tt_gen + 1) & 0xFFFF
+    search._nodes = 0
+    _, cold_score = search._search_root(board, 4, far, first_move)
+    cold_nodes = search._nodes
+
+    search._tt_gen = (search._tt_gen + 1) & 0xFFFF
+    search._nodes = 0
+    _, warm_score = search._search_root(board, 4, far, first_move)
+    warm_nodes = search._nodes
+
+    assert warm_score == cold_score
+    assert warm_nodes < cold_nodes // 2  # carried-over entries spare most of the re-search
+
+
+def test_tt_stores_no_value_it_cannot_encode() -> None:
+    # KR vs K, no mate for many plies: a fixed-depth search fills the table with real
+    # scores. Every stored value must sit inside the band -- a mate score (or anything
+    # past +-_TT_VALUE_MAX) has to be skipped, never wrapped into the 16-bit field.
+    assert search._TT_VALUE_MAX < search._MATE_THRESHOLD  # so mate scores can't be stored
+    board = chess.Board("8/6k1/8/8/8/8/1R4K1/8 w - - 0 1")
+    search._killers[:] = [None] * search._KILLER_SLOTS
+    search._hist[:] = [0] * 4096
+    search._tt_gen = (search._tt_gen + 1) & 0xFFFF
+    search._nodes = 0
+    search._search_root(board, 6, time.monotonic() + 120, next(iter(board.legal_moves)))
+
+    occupied = search._tt_key != 0
+    assert int(occupied.sum()) > 0
+    values = (search._tt_data & 0xFFFF).astype("int64") - 0x8000
+    oversized = occupied & ((values >= search._TT_VALUE_MAX) | (values <= -search._TT_VALUE_MAX))
+    assert int(oversized.sum()) == 0
+
+
+def test_reset_tt_wipes_the_table() -> None:
+    agent.get_move("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3", 2000)
+    assert int((search._tt_key != 0).sum()) > 0  # something got stored
+    search._reset_tt()
+    assert int((search._tt_key != 0).sum()) == 0
+    assert search._tt_gen == 0
 
 
 def test_cutoff_updates_killers_and_history() -> None:

@@ -308,3 +308,32 @@ here. Next eval work: king defenders + escape squares, rook-on-open-file, outpos
   non-check follow-up (Qh5) two plies past the sac -- outside a one-ply check window.
 - Gate + bench (watch the nps hit from `gives_check`) + arena vs `versions/phase5jit`
   pending.
+
+### 2026-09-08 -- Persistent transposition table (branch `persistent-tt`)
+
+The per-move dict TT is replaced by a fixed-size table kept across moves within a game
+(docs/PLAN.md Phase 4: "fixed-size, replace-by-depth, kept across moves ... not an
+unbounded dict"). A fresh process per game resets it; tests call `search._reset_tt()`.
+
+- Two flat `np.uint64` arrays, `_TT_BITS = 22` -> 4.2M slots, 64 MB, allocated at import,
+  no per-entry Python objects and no GC churn. Open-addressed, one probe at
+  `slot = key64 & mask`; `key64 = hash(_transposition_key()) & 2**64-1` (a tuple of
+  ints/bool/None, so `hash` is stable across runs), 0 reserved for the empty slot.
+- One entry packed per uint64: value (16-bit, offset-encoded), depth (8), flag (2),
+  best-move code (16), generation (16). `_move_code` / `_code_move` round-trip a
+  `chess.Move` through 16 bits (from | to<<6 | promo<<12).
+- Replace-by-depth *within* a generation; a slot from an older search or a different
+  position is always taken. `search_move` bumps `_tt_gen` instead of clearing.
+- `_TT_VALUE_MAX = 30_000`: scores outside +-this are not stored -- they can't fit the
+  field, and this subsumes the "don't cache mate scores" rule (measured from the root,
+  wrong down another path) without a separate check. The in-search-repetition draw is
+  still returned before the store, so it is never cached; a value *derived* from one
+  deeper down is mildly path-dependent but the generation stamp refreshes it within a
+  move or two -- the standard trade-off for a persistent table.
+- Local check: a second search of the same position at fixed depth 4 visits 27 nodes
+  vs 8,594 cold, same score. KR-vs-K depth 6 fills 3,399 slots, none oversized.
+- Tests: entry round-trip, persist-and-cut-nodes, no-oversized-value, `_reset_tt` wipe;
+  `_reset_tt()` added to the autouse fixtures in test_engine.py / test_positions.py and
+  to `test_is_deterministic` (the carried-over table is otherwise a hidden input).
+- Gate + bench (watch for an nps change from the packed probe) + arena vs
+  `versions/phase5jit` pending.
