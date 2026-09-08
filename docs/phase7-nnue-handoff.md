@@ -18,8 +18,13 @@ it — read that first if you haven't. Everything below assumes it.
 - Dataset grew from 3,875 → **44,529** positions (Lichess bulk archive + self-play + Magnus
   Carlsen's full 2001–2022 tournament career, 4,314 games). Still far short of the 5–10M
   target — see "What's still the real gap" below.
-- Two arena results exist against `versions/phase5`, on two different checkpoints (see
-  "Results" — read the caveat, they don't agree as cleanly as I'd like).
+- **Updated after a 128-game batch: the current checkpoint (with Carlsen data) is
+  approximately at parity with `versions/phase5`, not clearly ahead of it.** Pooled across all
+  192 games tested on this checkpoint, the score is ~51% (~+7 Elo) — within noise of a coin
+  flip. The earlier 64-game result (+72 Elo) that looked promising was itself within noise;
+  don't trust small-batch arena numbers on their own, see "Results" below for the full table.
+  Per the roadmap's own framing: "if it only ties phase5jit, it is not worth shipping over the
+  classical engine" — that's roughly where this stands right now.
 - **The vs-`main` comparison the roadmap's decision point calls for has not been rerun on the
   current checkpoint.** The only vs-`main` data point on file is stale (pre-dates the labelling
   bug fix and the full retrain). This needs to happen before anyone decides whether to ship
@@ -153,22 +158,26 @@ the roadmap calls `phase5jit`):
 | Dataset | Positions | Games | Score | Elo | 95% CI |
 |---|---|---|---|---|---|
 | Lichess + self-play only | 34,617 | 16 | 59.4% | +66 | −78 to +239 |
-| Lichess + self-play only | 34,617 | 64 | 65.6% | +112 | **+41 to +194** |
+| Lichess + self-play only | 34,617 | 64 | 65.6% | +112 | +41 to +194 |
 | + Carlsen career (current) | 44,529 | 64 | 60.2% | +72 | −4 to +155 |
+| + Carlsen career (current) | 44,529 | **128** | **46.5%** | **−24** | **−79 to +29** |
 
-**Read this honestly, not optimistically**: adding the Carlsen data moved the point estimate
-down (+112 → +72) and the interval now just barely touches zero, so it's no longer an
-unambiguous win at 95% confidence the way the pre-Carlsen 64-game result was. The two
-intervals overlap heavily though (both centered somewhere around +70–110 Elo), so this is
-plausibly sample noise from a 64-game batch rather than the Carlsen data actually hurting —
-elite 2001–2022 OTB games are a genuinely different distribution (different time controls,
-very early games from when Carlsen was ~2000-rated) than Lichess blitz/rapid, so some dilution
-wouldn't be shocking either. **This is not resolved. A larger batch (128+ games) on the
-current checkpoint would settle it** — I didn't run one yet given the Thursday deadline
-pressure, and made the call to keep the Carlsen-augmented checkpoint as current since it's
-still positive on point estimate and adds real distributional diversity. Overridable — the
-data and both checkpoints (`runs_bigdata/model.pt` pre-Carlsen, `runs_v2/model.pt` current)
-are both still in the repo if you want to compare them yourself or revert.
+**The 128-game batch is the one to trust, and it's a sobering result.** Pooled across the two
+batches run on the current (post-Carlsen) checkpoint — 192 games total, 78 wins / 40 draws /
+74 losses — the combined score is **~51% (~+7 Elo)**: essentially parity with `phase5`, not a
+real edge either direction. The 64-game and 16-game numbers that looked promising earlier were
+within ordinary sampling noise, not a real signal — **don't trust arena results under ~100+
+games on their own**, this whole session is a live example of why. Whether the Carlsen data
+specifically caused the regression from the pre-Carlsen 64-game result (+112 Elo) or whether
+that number was *also* just noise on the high side is genuinely unclear without testing the
+pre-Carlsen checkpoint (`runs_bigdata/model.pt`) at 128+ games too — that comparison hasn't
+been run and would be worth doing before concluding anything about Carlsen data specifically.
+
+Per the roadmap's own words: *"if it only ties phase5jit, it is not worth shipping over the
+classical engine that already beats phase5jit."* That's roughly where the current checkpoint
+sits. This doesn't mean the NNUE track is dead — it means the "what's still the real gap"
+items below (data volume most of all) are not optional polish, they're the difference between
+a proof of concept and something worth shipping.
 
 **Not yet done, and it's the roadmap's actual decision point**: `nnue_agent` vs classical
 `main`, 100+ games. The only number on file for that comparison (main +2=2−12 vs an early NNUE
