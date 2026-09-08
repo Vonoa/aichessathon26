@@ -288,3 +288,23 @@ accepted) and conversion stalls (won position shuffled to a draw, slow KQ/KR-vs-
 
 King-in-centre eval term and a position test set from the losses are noted but not done
 here. Next eval work: king defenders + escape squares, rook-on-open-file, outposts.
+
+### 2026-09-08 -- Checks in quiescence + ordered fallback move (branch `qsearch-checks`)
+
+- **Quiet checks in qsearch.** `_qsearch` gains a `qply` counter; for the first
+  `_QS_CHECK_PLIES` (1) plies past the horizon, when not in check, it also generates up
+  to `_QS_CHECK_CAP` (6) non-capturing checking moves alongside the captures/promotions.
+  Purely a chance to raise the score -- a bad check just scores low and is ignored -- so
+  stand-pat stays sound. Catches the forcing shot (knight fork with check, back-rank
+  skewer) a captures-only qsearch walked past. `board.gives_check` is only called on
+  quiet non-promo moves while under the cap and inside the check window, so deeper
+  qnodes pay nothing. New unit test: Nf4+ fork, stand-pat -332 -> qsearch +210.
+- **Ordered fallback move.** `search_move` seeded `best` with `legal[0]` (raw
+  python-chess order); an interrupted first ID pass under severe time pressure then
+  returned a near-random move. Now `best = _ordered(board, legal)[0]` -- MVV-LVA/history
+  order, deterministic, strictly better. Matters in the endgame clock scrambles
+  (Rated 60/61 finished under 13 s).
+- Not expected to fix the Greek-gift losses (R56): the mate there needs a quiet
+  non-check follow-up (Qh5) two plies past the sac -- outside a one-ply check window.
+- Gate + bench (watch the nps hit from `gives_check`) + arena vs `versions/phase5jit`
+  pending.

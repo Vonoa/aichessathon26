@@ -8,7 +8,8 @@ replaces the python-chess move loop with a jitted generator.
 
 Phase 4a adds quiescence search: at the horizon, keep searching captures (and check
 evasions) until the position is quiet before calling evaluate(), so the score is never
-read in the middle of an exchange.
+read in the middle of an exchange. It also follows one ply of quiet checks past the
+horizon, so a forcing shot (knight fork with check, back-rank skewer) is not missed.
 
 Phase 4b adds killer moves and a history heuristic: a quiet move that caused a beta
 cutoff is tried early in sibling nodes (killer, per ply) and its from/to square pair
@@ -41,6 +42,8 @@ _RESERVE_MS = 500  # keep at least this on the clock; the watchdog does not forg
 _CHECK_INTERVAL = 255  # test the wall clock once per this many nodes
 _MAX_DEPTH = 64
 _QS_MAX_PLY = _MAX_DEPTH + 32  # hard cap on quiescence recursion, a safety net
+_QS_CHECK_PLIES = 1  # follow non-capturing checks this many plies past the horizon
+_QS_CHECK_CAP = 6  # at most this many quiet checking moves added per quiescence node
 
 _EXACT, _LOWER, _UPPER = 0, 1, 2  # transposition-table bound kinds
 _TT_MAX = 1_000_000  # entries; clear rather than grow past this
@@ -101,7 +104,9 @@ def search_move(
 
     started = time.monotonic()
     deadline = started + _budget_s(board, time_left_ms, increment_ms)
-    best = legal[0]
+    # Ordered so that an interrupted first pass (severe time pressure) still returns the
+    # best-looking move rather than whatever python-chess happened to generate first.
+    best = _ordered(board, legal)[0]
     score = 0
     for depth in range(1, _MAX_DEPTH + 1):
         try:
@@ -266,12 +271,20 @@ def _negamax(
     return value
 
 
-def _qsearch(board: chess.Board, ply: int, alpha: int, beta: int, deadline: float) -> int:
-    """Search only captures (all evasions when in check) until the position is quiet.
+def _qsearch(
+    board: chess.Board, ply: int, alpha: int, beta: int, deadline: float, qply: int = 0
+) -> int:
+    """Search captures, promotions, and - for the first _QS_CHECK_PLIES plies past the
+    horizon - quiet checks, until the position is quiet. All evasions when in check.
 
     Without this the evaluation is read mid-exchange - "up a queen" one ply before the
     recapture - and is wrong. The stand-pat score assumes the side to move can hold at
     least the static eval, which fails only in zugzwang and is a standard trade-off.
+
+    Following one ply of quiet checks catches the forcing shot - a knight fork with check,
+    a back-rank skewer - that a captures-only qsearch walks past. It can only raise the
+    score (a bad check just scores low and is ignored), so stand-pat stays sound; qply
+    gates the extra generation only, not the recursion depth.
     """
     _tick(deadline)
     if ply >= _QS_MAX_PLY:
@@ -288,11 +301,19 @@ def _qsearch(board: chess.Board, ply: int, alpha: int, beta: int, deadline: floa
             return best
         if best > alpha:
             alpha = best
-        moves = [m for m in board.legal_moves if board.is_capture(m) or m.promotion is not None]
+        want_checks = qply < _QS_CHECK_PLIES
+        captures: list[chess.Move] = []
+        checks: list[chess.Move] = []
+        for m in board.legal_moves:
+            if board.is_capture(m) or m.promotion is not None:
+                captures.append(m)
+            elif want_checks and len(checks) < _QS_CHECK_CAP and board.gives_check(m):
+                checks.append(m)
+        moves = captures + checks
 
     for move in _ordered(board, moves):
         board.push(move)
-        score = -_qsearch(board, ply + 1, -beta, -alpha, deadline)
+        score = -_qsearch(board, ply + 1, -beta, -alpha, deadline, qply + 1)
         board.pop()
         if score > best:
             best = score

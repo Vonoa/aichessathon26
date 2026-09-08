@@ -94,6 +94,21 @@ def test_qsearch_leaves_a_quiet_position_at_the_static_eval() -> None:
     assert q == evaluate.evaluate(board)
 
 
+def test_qsearch_follows_a_quiet_check_to_win_material() -> None:
+    # White is down a queen for a knight, but Nf4+ forks the king and the queen. There is
+    # no capture in the position, so a captures-only quiescence just stands pat here;
+    # following one ply of quiet checks finds the fork and swings the score back.
+    board = chess.Board("r7/8/4k1q1/8/8/3N4/6PP/1R4K1 w - - 0 1")
+    deadline = time.monotonic() + 5
+    stand_pat = evaluate.evaluate(board)
+    q = search._qsearch(board, 1, -search.MATE - 1, search.MATE + 1, deadline)
+    assert stand_pat < -300  # really is down material before the tactic
+    assert q > stand_pat + 400  # the quiet check is searched and the fork is found
+    # With the check window exhausted (qply past _QS_CHECK_PLIES) it reverts to stand-pat.
+    no_checks = search._qsearch(board, 1, -search.MATE - 1, search.MATE + 1, deadline, 9)
+    assert no_checks == stand_pat
+
+
 def test_cutoff_updates_killers_and_history() -> None:
     move = chess.Move.from_uci("e2e4")
     base = 3 * 2
