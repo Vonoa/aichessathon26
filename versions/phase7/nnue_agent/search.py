@@ -31,8 +31,7 @@ import time
 from collections.abc import Hashable
 
 import chess
-
-from evaluate import evaluate
+from nnue_incremental import Accumulator
 
 MATE = 1_000_000
 _MATE_THRESHOLD = MATE - 1_000  # a score past this is a forced mate
@@ -62,6 +61,7 @@ _seen: frozenset[Hashable] = frozenset()
 _tt: dict[Hashable, tuple[int, int, int, chess.Move | None]] = {}
 _killers: list[chess.Move | None] = [None] * _KILLER_SLOTS  # two per ply, flat: ply*2, ply*2+1
 _hist: list[int] = [0] * 4096  # quiet-move cutoff counts, indexed from_square*64 + to_square
+_acc = Accumulator()  # incremental NNUE first-layer state, pushed/popped alongside board
 
 
 class _Timeout(Exception):
@@ -87,6 +87,7 @@ def search_move(
     _tt.clear()
     _killers[:] = [None] * _KILLER_SLOTS
     _hist[:] = [0] * 4096
+    _acc.set_root(board)
 
     # Capture the move label now: an interrupted search unwinds through _Timeout without
     # popping, so board.fullmove_number / board.turn are unreliable once the loop ends.
@@ -161,9 +162,11 @@ def _search_root(
     best_score = -MATE - 1
     alpha = -MATE - 1
     for move in moves:
+        _acc.push(board, move)
         board.push(move)
         score = -_negamax(board, depth - 1, 1, -MATE - 1, -alpha, deadline)
         board.pop()
+        _acc.pop()
         if score > best_score:
             best_score = score
             best_move = move
@@ -221,6 +224,7 @@ def _negamax(
     best_move: chess.Move | None = None
     for move_index, move in enumerate(ordered):
         quiet = move.promotion is None and not board.is_capture(move)
+        _acc.push(board, move)
         board.push(move)
 
         # Late-move reduction: quiet moves ordered late are probably bad, so search them
@@ -241,6 +245,7 @@ def _negamax(
             score = -_negamax(board, depth - 1, ply + 1, -beta, -alpha, deadline)
 
         board.pop()
+        _acc.pop()
         if score > value:
             value = score
             best_move = move
@@ -275,7 +280,7 @@ def _qsearch(board: chess.Board, ply: int, alpha: int, beta: int, deadline: floa
     """
     _tick(deadline)
     if ply >= _QS_MAX_PLY:
-        return evaluate(board)
+        return _acc.evaluate_cp(board)
 
     if board.is_check():
         moves = list(board.legal_moves)
@@ -283,7 +288,7 @@ def _qsearch(board: chess.Board, ply: int, alpha: int, beta: int, deadline: floa
             return -MATE + ply
         best = -MATE - 1
     else:
-        best = evaluate(board)
+        best = _acc.evaluate_cp(board)
         if best >= beta:
             return best
         if best > alpha:
@@ -291,9 +296,11 @@ def _qsearch(board: chess.Board, ply: int, alpha: int, beta: int, deadline: floa
         moves = [m for m in board.legal_moves if board.is_capture(m) or m.promotion is not None]
 
     for move in _ordered(board, moves):
+        _acc.push(board, move)
         board.push(move)
         score = -_qsearch(board, ply + 1, -beta, -alpha, deadline)
         board.pop()
+        _acc.pop()
         if score > best:
             best = score
         if score > alpha:
