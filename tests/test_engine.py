@@ -191,6 +191,45 @@ def test_reset_tt_wipes_the_table() -> None:
     assert search._tt_gen == 0
 
 
+def _play_out(fen: str, cap: int = 60) -> chess.Board:
+    board = chess.Board(fen)
+    agent._history.clear()
+    agent._clock.clear()
+    search._reset_tt()
+    plies = 0
+    while not board.is_game_over(claim_draw=True) and plies < cap:
+        board.push(chess.Move.from_uci(agent.get_move(board.fen(), 60_000)))
+        plies += 1
+    return board
+
+
+def test_syzygy_returns_none_outside_the_tables() -> None:
+    # The opening position has 32 men; the tablebase path must decline it.
+    assert search._tb_root_move(chess.Board()) is None
+
+
+@pytest.mark.skipif(search._tablebase is None, reason="no syzygy files in ./syzygy")
+def test_syzygy_mates_a_rook_ending() -> None:
+    board = _play_out("8/8/8/4k3/8/8/R7/4K3 w - - 0 1")
+    assert board.is_checkmate(), board.fen()
+
+
+@pytest.mark.skipif(search._tablebase is None, reason="no syzygy files in ./syzygy")
+def test_syzygy_holds_a_drawn_pawn_ending() -> None:
+    # K+P vs K with the defending king on the queening square: a book draw. The engine
+    # must not throw it (this is the Rated 61 / 62 failure mode).
+    board = _play_out("8/8/8/3k4/8/3K4/3P4/8 w - - 0 1")
+    result = board.result(claim_draw=True)
+    assert result == "1/2-1/2", f"{result} {board.fen()}"
+
+
+@pytest.mark.skipif(search._tablebase is None, reason="no syzygy files in ./syzygy")
+def test_syzygy_converts_a_won_pawn_ending() -> None:
+    # White king two ranks ahead of the pawn: a book win. DTZ play must finish it.
+    board = _play_out("8/8/3k4/8/3K4/8/3P4/8 w - - 0 1")
+    assert board.result(claim_draw=True) == "1-0", board.fen()
+
+
 def test_cutoff_updates_killers_and_history() -> None:
     move = chess.Move.from_uci("e2e4")
     base = 3 * 2

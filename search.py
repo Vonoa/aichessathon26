@@ -32,6 +32,7 @@ import time
 from collections.abc import Hashable
 
 import chess
+import chess.syzygy
 import numpy as np
 import numpy.typing as npt
 
@@ -51,6 +52,22 @@ _EXACT, _LOWER, _UPPER = 0, 1, 2  # transposition-table bound kinds
 _LMR_MIN_DEPTH = 3  # only reduce late moves with this much depth left
 _LMR_MIN_MOVE = 3  # first this many moves at each node are searched at full depth
 _ASPIRATION = 40  # centipawns; the half-width of the first window around the last score
+
+# Syzygy endgame tablebases. When the board is down to this few men and ./syzygy holds
+# the files, search_move picks the move straight from the tables (WDL for the outcome,
+# DTZ for the fastest conversion) and skips the search entirely -- perfect endgame play.
+# A missing / empty dir just leaves _tablebase None and nothing changes. The package step
+# must be told to ship the folder:  uv run python -m harness.package --include syzygy
+_TB_MAX_PIECES = 5  # use the tables at this many men or fewer (3-4-5 syzygy; we ship 3-man)
+_SYZYGY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "syzygy")
+_tablebase: chess.syzygy.Tablebase | None = None
+try:
+    if os.path.isdir(_SYZYGY_DIR) and any(f.endswith(".rtbw") for f in os.listdir(_SYZYGY_DIR)):
+        _tablebase = chess.syzygy.open_tablebase(_SYZYGY_DIR)
+        print(f"syzygy: loaded from {_SYZYGY_DIR}", flush=True)
+except Exception as _tb_exc:  # a tablebase must never break import
+    print(f"syzygy: disabled ({type(_tb_exc).__name__}: {_tb_exc})", flush=True)
+    _tablebase = None
 
 # Move-ordering score bands: captures and promotions on top, then the two killer slots
 # for this ply, then quiet moves ranked by the history heuristic (well below these).
@@ -149,6 +166,11 @@ def search_move(
     if len(legal) == 1:
         _log_move(label, legal[0], 0, 0, time_left_ms, time.monotonic())
         return legal[0].uci()
+
+    tb_move = _tb_root_move(board)
+    if tb_move is not None:
+        _log_move(label, chess.Move.from_uci(tb_move), 0, 0, time_left_ms, time.monotonic())
+        return tb_move
 
     started = time.monotonic()
     deadline = started + _budget_s(board, time_left_ms, increment_ms)
@@ -473,6 +495,44 @@ def _draw_score(ply: int) -> int:
     always recurs at the same ply parity).
     """
     return -_CONTEMPT if ply % 2 == 0 else _CONTEMPT
+
+
+def _tb_root_move(board: chess.Board) -> str | None:
+    """Best move straight from the Syzygy tables, in UCI, or None if the position is not
+    fully covered (too many men, a missing file, castling rights). Outcome first (WDL),
+    then Distance-To-Zero for the fastest win / most stubborn loss; a move that resets the
+    fifty-move counter (capture or pawn push) is preferred when winning and avoided when
+    losing, so a real conversion never stalls on the fifty-move rule.
+    """
+    if _tablebase is None or chess.popcount(board.occupied) > _TB_MAX_PIECES:
+        return None
+    scored: list[tuple[chess.Move, int, int, bool, bool]] = []
+    try:
+        for move in board.legal_moves:
+            zeroing = board.is_zeroing(move)
+            board.push(move)
+            try:
+                mate = board.is_checkmate()
+                # our point of view: +ve wdl / +ve dtz == good for the side that just moved
+                wdl = 2 if mate else -_tablebase.probe_wdl(board)
+                dtz = 0 if mate else -_tablebase.probe_dtz(board)
+            finally:
+                board.pop()
+            scored.append((move, wdl, dtz, zeroing, mate))
+    except Exception:  # any gap in the tables -> let the search handle it
+        return None
+    if not scored:
+        return None
+
+    best_wdl = max(s[1] for s in scored)
+    pool = [s for s in scored if s[1] == best_wdl]
+    if best_wdl > 0:  # winning: mate now, else a counter-resetting move, else shortest DTZ
+        pool.sort(key=lambda s: (not s[4], not s[3], s[2] if s[2] >= 0 else 1_000_000))
+    elif best_wdl < 0:  # losing: drag it out -- keep the counter running, largest |DTZ|
+        pool.sort(key=lambda s: (s[3], s[2]))
+    else:  # drawn: hold it; stable order is fine
+        pool.sort(key=lambda s: s[3])
+    return pool[0][0].uci()
 
 
 def _tick(deadline: float) -> None:
