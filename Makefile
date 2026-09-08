@@ -18,7 +18,7 @@ arena:
 	uv run python -m harness.arena --opponent baselines/greedy
 
 zip:
-	uv run python -m harness.package
+	uv run python -m harness.package --include syzygy
 
 gate:
 	uv run ruff check .

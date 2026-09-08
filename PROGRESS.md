@@ -357,3 +357,27 @@ Next two items of the Phase 4 pruning stack, on top of the persistent TT.
 - Gate + bench (depth reached in fixed time is the signal) + arena vs
   `versions/phase5jit` pending. If the bench shows aspiration costing depth on
   volatile scores, widen `_ASPIRATION` or gate it to deeper plies; PVS stays either way.
+
+### 2026-09-08 -- Syzygy tablebases at the root (branch `syzygy`)
+
+3-man WDL + DTZ Syzygy files ship in `syzygy/` (~26 KB: KP/KQ/KR/KB/KN vs K). When the
+board is down to `_TB_MAX_PIECES` (5) men or fewer and the files are present,
+`search_move` picks the move straight from the tables and skips the search:
+
+- `_tb_root_move`: for each legal move, probe WDL (outcome) and DTZ (plies-to-zero) from
+  our point of view. Rank by best WDL first; among those, when winning: mate-in-1, then a
+  fifty-move-counter-resetting move (capture / pawn push), then smallest DTZ; when losing:
+  drag it out (largest |DTZ|, keep the counter running); a draw just holds.
+- `chess.syzygy.open_tablebase("syzygy")` at import, wrapped so a missing/empty dir or a
+  bad file leaves `_tablebase = None` and nothing changes. Any probe gap (piece count not
+  covered, missing file) makes `_tb_root_move` return None and the search runs as normal.
+- A **first attempt** put a WDL probe inside `_negamax`/`_qsearch`, but that suppressed
+  the search and the 1-ply mop-up gradient just orbited the lone king without mating
+  (KRvK not mated in 40+). Reverted; root-only DTZ selection mates KRvK in 27 plies,
+  KQvK in 11, converts won K+P-vs-K, and correctly holds drawn K+P-vs-K (the Rated
+  61/62 failure mode).
+- **Packaging:** the folder is not auto-detected. Build with
+  `uv run python -m harness.package --include syzygy` or the tables do not ship and the
+  engine silently falls back to search.
+- Gate + arena vs `versions/phase5jit` pending. `make gate` skips the syzygy tests if
+  `search._tablebase is None`.
