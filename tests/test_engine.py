@@ -144,6 +144,34 @@ def test_null_move_pruning_cuts_nodes() -> None:
     assert with_nodes < without_nodes
 
 
+def test_reverse_futility_prunes_nodes() -> None:
+    # White is up a rook and three pawns; the static eval clears beta by miles at
+    # shallow interior nodes, so reverse-futility fails them high without searching.
+    board = chess.Board("4k3/7p/8/8/8/8/PPP5/1K1R4 w - - 0 1")
+    far = time.monotonic() + 120
+    window = (-search.MATE - 1, search.MATE + 1)
+
+    def run() -> tuple[int, int]:
+        search._reset_tt()
+        search._killers[:] = [0] * search._KILLER_SLOTS
+        search._hist[:] = [0] * 4096
+        search._tt_gen = (search._tt_gen + 1) & 0xFFFF
+        search._nodes = 0
+        bb, state = movegen.encode(board)
+        _, sc = search._search_root(bb, state, 6, far, 0, *window)
+        return sc, search._nodes
+
+    with_score, with_nodes = run()
+    saved = search._RFP_MAX_DEPTH
+    search._RFP_MAX_DEPTH = 0  # _negamax never reaches the block with depth <= 0
+    try:
+        without_score, without_nodes = run()
+    finally:
+        search._RFP_MAX_DEPTH = saved
+    assert with_score > 300 and without_score > 300  # the win survives the pruning
+    assert with_nodes < without_nodes
+
+
 def test_seen_position_is_a_draw_at_the_horizon() -> None:
     # A position already seen in the game must score as a draw even at the horizon, not
     # be evaluated by material. With contempt a draw is not exactly 0.

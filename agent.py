@@ -10,7 +10,7 @@ import search
 
 # Bump this on every upload. It prints once at import, so the per-game log the platform
 # keeps names exactly which build played that game.
-BUILD = "diag-10 texel pawn-structure"
+BUILD = "diag-11 reverse-futility pruning"
 print(f"agent build: {BUILD}", flush=True)
 
 # Import time runs once per game, inside a 90 second budget, before your clock starts.

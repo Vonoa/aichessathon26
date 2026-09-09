@@ -45,6 +45,8 @@ _LMR_MIN_MOVE = 3  # first this many moves at each node are searched at full dep
 _ASPIRATION = 40  # centipawns; the half-width of the first window around the last score
 _NMP_MIN_DEPTH = 3  # only try a null move with at least this much depth left
 _SEE_QS_MARGIN = 90  # quiescence keeps a capture unless SEE is worse than -this
+_RFP_MAX_DEPTH = 6  # reverse-futility pruning only near the frontier
+_RFP_MARGIN = 75  # centipawns per ply the static eval must clear beta by
 
 # Syzygy endgame tablebases. When the board is down to this few men and ./syzygy holds
 # the files, search_move picks the move straight from the tables (WDL for the outcome,
@@ -358,6 +360,22 @@ def _negamax(
             if e_flag == _UPPER and e_value <= alpha:
                 return e_value
 
+    # Static eval, shared by reverse-futility and null-move pruning below. Meaningless
+    # in check (no stand-pat), so we skip it there and neither prune can fire.
+    static_eval = 0 if in_check else _eval_bb(bb, state)
+
+    # Reverse futility pruning: in a non-PV node near the frontier, if the static eval
+    # clears beta by a generous depth-scaled margin, the opponent is very unlikely to
+    # claw it back -- fail high now instead of searching. Held off near mate scores.
+    if (
+        not in_check
+        and beta - alpha == 1
+        and depth <= _RFP_MAX_DEPTH
+        and abs(beta) < _MATE_THRESHOLD
+        and static_eval - _RFP_MARGIN * depth >= beta
+    ):
+        return static_eval - _RFP_MARGIN * depth
+
     # Null-move pruning: hand the opponent a free move and search shallower; if we are
     # still >= beta even a tempo down, the real search would only confirm the cutoff.
     # Gated on the static eval already being >= beta (without it the null search is pure
@@ -368,7 +386,7 @@ def _negamax(
         and depth >= _NMP_MIN_DEPTH
         and abs(beta) < _MATE_THRESHOLD
         and _has_non_pawn_material(bb, turn)
-        and _eval_bb(bb, state) >= beta
+        and static_eval >= beta
     ):
         r = 3 if depth >= 6 else 2
         old_turn, old_ep, old_half = int(state[0]), int(state[2]), int(state[3])
