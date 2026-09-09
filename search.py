@@ -49,6 +49,8 @@ _RFP_MAX_DEPTH = 6  # reverse-futility pruning only near the frontier
 _RFP_MARGIN = 75  # centipawns per ply the static eval must clear beta by
 _FUTILITY_MAX_DEPTH = 2  # futility-prune quiet moves only at the frontier
 _FUTILITY_MARGIN = 120  # centipawns per ply a quiet move must come within alpha
+_LMP_MAX_DEPTH = 3  # late-move (move-count) pruning only near the leaves
+_LMP_BASE = 3  # search this many quiets + depth^2 before skipping the rest
 
 # Syzygy endgame tablebases. When the board is down to this few men and ./syzygy holds
 # the files, search_move picks the move straight from the tables (WDL for the outcome,
@@ -412,6 +414,21 @@ def _negamax(
         flag = (code >> 15) & 7
         is_cap = flag == 2 or ((enemy_occ >> to) & 1)
         quiet = ((code >> 12) & 7) == 0 and not is_cap
+
+        # Late-move pruning: in a non-PV node near the leaves, once enough quiet moves
+        # have been tried without raising alpha, the ordering says the rest are very
+        # unlikely to -- skip them without even making the move. Held off in check and
+        # until we have a move that at least escapes mate.
+        if (
+            quiet
+            and not in_check
+            and beta - alpha == 1
+            and depth <= _LMP_MAX_DEPTH
+            and move_index >= _LMP_BASE + depth * depth
+            and value > -_MATE_THRESHOLD
+        ):
+            continue
+
         undo = movegen._make(bb, state, code)
 
         if move_index == 0:
