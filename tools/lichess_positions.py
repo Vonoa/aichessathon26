@@ -71,7 +71,7 @@ def extract(
                 )
 
             h = game.headers
-            if h.get("Variant", "Standard") not in ("Standard", "From Position"):
+            if h.get("Variant", "Standard") != "Standard":
                 continue
             result = _RESULT.get(h.get("Result", "*"))
             if result is None:
@@ -82,6 +82,7 @@ def extract(
 
             board = game.board()
             rows: list[str] = []
+            ply = -1  # stays -1 for a 0-move game, so the length check below drops it
             for ply, move in enumerate(game.mainline_moves()):
                 if ply >= max_plies:
                     break
@@ -113,11 +114,16 @@ def main() -> None:
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--min-elo", type=int, default=1600)
     p.add_argument("--max-elo", type=int, default=2600)
-    p.add_argument("--sample-every", type=int, default=10, help="one FEN per this many full moves")
+    p.add_argument("--sample-every", type=int, default=6, help="one FEN per this many full moves")
     p.add_argument("--skip-plies", type=int, default=12, help="ignore this many opening plies")
     p.add_argument("--max-plies", type=int, default=160)
     p.add_argument("--min-plies", type=int, default=24, help="skip games shorter than this")
-    p.add_argument("--max-positions", type=int, default=4_000_000)
+    p.add_argument(
+        "--max-positions",
+        type=int,
+        default=20_000_000,
+        help="hard cap; a 2014 month is well under this",
+    )
     args = p.parse_args()
     extract(
         args.src,

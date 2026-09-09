@@ -404,25 +404,27 @@ def encode_dataset(
     npt.NDArray[np.int64],
     npt.NDArray[np.int64],
     npt.NDArray[np.int32],
-    npt.NDArray[np.bool_],
+    npt.NDArray[np.int64],
 ]:
-    """FEN list -> stacked (pieces, occ, white_king, black_king, shipped_eval) arrays and
-    a keep mask. Drops: unparseable, no king, in check, stalemate, insufficient material,
-    and -- when quiet_filter -- any position with a SEE>=0 capture on the board. The
-    shipped_eval column (seed weights, White POV) feeds the optional WDL blend.
+    """FEN list -> stacked (pieces, occ, white_king, black_king, shipped_eval) arrays for
+    the KEPT rows only, plus the kept-row indices into `fens`. Drops: unparseable, no
+    king, in check, stalemate, insufficient material, and -- when quiet_filter -- any
+    position with a SEE>=0 capture on the board. shipped_eval (seed weights, White POV)
+    feeds the optional WDL blend. Building only the kept rows keeps the peak allocation
+    at the filtered size, not the raw size, so the dataset can be large.
     """
-    n = len(fens)
-    pieces = np.zeros((n, 2, 6), dtype=np.uint64)
-    occ = np.zeros((n, 3), dtype=np.uint64)
-    wk = np.zeros(n, dtype=np.int64)
-    bk = np.zeros(n, dtype=np.int64)
-    seval = np.zeros(n, dtype=np.int32)
-    keep = np.ones(n, dtype=np.bool_)
+    p_list: list[npt.NDArray[np.uint64]] = []
+    o_list: list[npt.NDArray[np.uint64]] = []
+    wk_list: list[int] = []
+    bk_list: list[int] = []
+    sev_list: list[int] = []
+    kept: list[int] = []
     for i, fen in enumerate(fens):
+        if i % 250_000 == 0 and i:
+            print(f"  scanned {i}/{len(fens)}  kept {len(kept)} ...")
         try:
             board = chess.Board(fen)
         except ValueError:
-            keep[i] = False
             continue
         wksq = board.king(chess.WHITE)
         bksq = board.king(chess.BLACK)
@@ -433,22 +435,30 @@ def encode_dataset(
             or board.is_stalemate()
             or board.is_insufficient_material()
         ):
-            keep[i] = False
             continue
         bb, state = movegen.encode(board)
         if quiet_filter and not _is_quiet(bb, state):
-            keep[i] = False
             continue
         p, o, _ = ev._encode(board)
-        pieces[i] = p
-        occ[i] = o
-        wk[i] = wksq
-        bk[i] = bksq
+        p_list.append(p.copy())
+        o_list.append(o.copy())
+        wk_list.append(wksq)
+        bk_list.append(bksq)
         shipped = ev.evaluate(board)
-        seval[i] = shipped if board.turn == chess.WHITE else -shipped
-        if i % 200_000 == 0 and i:
-            print(f"  encoded {i}/{n} ...")
-    return pieces, occ, wk, bk, seval, keep
+        sev_list.append(shipped if board.turn == chess.WHITE else -shipped)
+        kept.append(i)
+    if not kept:
+        raise SystemExit("no usable positions after filtering")
+    pieces = np.stack(p_list)
+    occ = np.stack(o_list)
+    return (
+        pieces,
+        occ,
+        np.asarray(wk_list, dtype=np.int64),
+        np.asarray(bk_list, dtype=np.int64),
+        np.asarray(sev_list, dtype=np.int32),
+        np.asarray(kept, dtype=np.int64),
+    )
 
 
 def _assert_replica_matches_shipped(
@@ -662,11 +672,21 @@ def main() -> None:
     for path in files:
         hasher.update(path.read_bytes())
         part_fens, part_targets, part_ids = load_dataset(path, None)
+        # A blank id (2-column format) gets a per-row unique id -> a plain random split
+        # for those rows instead of dumping the whole file into one train/val bucket.
+        game_ids.extend(
+            f"{path.stem}:{g}" if g else f"{path.stem}:r{len(fens) + n}"
+            for n, g in enumerate(part_ids)
+        )
         fens.extend(part_fens)
-        game_ids.extend(f"{path.stem}:{g}" for g in part_ids)
         targets_list.append(part_targets)
         print(f"  {path}  rows={len(part_fens)}")
     targets = np.concatenate(targets_list)
+    # Shuffle before any --limit so the cap samples every file, not just the first ones.
+    order = np.random.default_rng(args.seed).permutation(len(fens))
+    fens = [fens[i] for i in order]
+    game_ids = [game_ids[i] for i in order]
+    targets = targets[order]
     if args.limit is not None and len(fens) > args.limit:
         fens, game_ids, targets = fens[: args.limit], game_ids[: args.limit], targets[: args.limit]
     digest = hasher.hexdigest()[:16]
@@ -674,34 +694,29 @@ def main() -> None:
     print(f"{len(files)} file(s)  sha256[:16]={digest}  rows={len(fens)}")
 
     t0 = time.time()
-    pieces, occ, wk, bk, seval, keep = encode_dataset(fens, not args.no_quiet_filter)
-    fens = [f for f, flag in zip(fens, keep, strict=True) if flag]
-    game_ids = [g for g, flag in zip(game_ids, keep, strict=True) if flag]
-    targets, seval = targets[keep], seval[keep]
-    pieces, occ, wk, bk = pieces[keep], occ[keep], wk[keep], bk[keep]
-    filt = "quiet-filtered" if not args.no_quiet_filter else "no quiet filter"
+    pieces, occ, wk, bk, seval, kept = encode_dataset(fens, not args.no_quiet_filter)
+    n_scanned = len(fens)
+    fens = [fens[i] for i in kept]
+    game_ids = [game_ids[i] for i in kept]
+    targets = targets[kept]
+    filt = "no quiet filter" if args.no_quiet_filter else "quiet-filtered"
     print(
-        f"encoded {len(fens)} usable positions in {time.time() - t0:.1f}s "
-        f"({int((~keep).sum())} dropped: check/terminal/no-king/{filt})"
+        f"kept {len(fens)} / {n_scanned} positions in {time.time() - t0:.1f}s "
+        f"(dropped check / terminal / no-king / {filt})"
     )
 
     if args.blend < 1.0:
-        wdl = targets.copy()
-        targets = args.blend * wdl + (1.0 - args.blend) * (
-            1.0 / (1.0 + np.exp(-seval.astype(np.float64) / 400.0))
-        )
+        prob = 1.0 / (1.0 + np.exp(-np.clip(seval.astype(np.float64), -2000.0, 2000.0) / 400.0))
+        targets = args.blend * targets + (1.0 - args.blend) * prob
         print(f"blended targets: {args.blend:.2f}*WDL + {1 - args.blend:.2f}*sigmoid(eval/400)")
 
     _assert_replica_matches_shipped(fens, pieces, occ, wk, bk)
 
-    # Split so no game straddles train/val. Rows from format-2 files (no game id) fall
-    # back to a per-row id, i.e. a plain random split for those.
+    # Split so no game straddles train/val (2-column rows have per-row ids -> random).
     rng = np.random.default_rng(args.seed)
     uniq = sorted(set(game_ids))
-    val_games = set(
-        rng.choice(len(uniq), size=max(1, int(len(uniq) * args.val_frac)), replace=False)
-    )
-    val_lut = {uniq[i] for i in val_games}
+    n_val_groups = max(1, int(len(uniq) * args.val_frac))
+    val_lut = {uniq[i] for i in rng.choice(len(uniq), size=n_val_groups, replace=False)}
     is_val = np.array([g in val_lut for g in game_ids])
     val_idx = np.nonzero(is_val)[0]
     train_idx = np.nonzero(~is_val)[0]
