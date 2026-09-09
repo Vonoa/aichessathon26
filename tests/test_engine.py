@@ -118,8 +118,10 @@ def test_has_non_pawn_material() -> None:
 
 
 def test_null_move_pruning_cuts_nodes() -> None:
-    # White is clearly better; a null move still fails high, so NMP prunes.
-    board = chess.Board("r2q1rk1/pp2bppp/2n1bn2/3p4/3P4/2NBPN2/PP3PPP/R2Q1RK1 w - - 0 11")
+    # White is a clean knight up with a full board: the null search fails high all over
+    # the tree, so NMP prunes. (A near-equal position makes NMP's saving too fragile to
+    # assert -- an eval tweak can flip it, as the king-safety bump did.)
+    board = chess.Board("r2q1rk1/pp2bppp/2n1b3/3p4/3P4/2NBPN2/PP3PPP/R2Q1RK1 w - - 0 11")
     far = time.monotonic() + 120
     window = (-search.MATE - 1, search.MATE + 1)
 
