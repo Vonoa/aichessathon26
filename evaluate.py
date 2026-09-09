@@ -6,10 +6,11 @@ This merges two previously separate pieces of work into one file:
     so it applies at near-full weight in the middlegame and fades to ~0 in the endgame,
     where an exposed king is not a liability -- it's supposed to walk to the center.
 
-All weights below are PLACEHOLDERS, seeded from public-style values so the function is
-correct and produces sane scores before any tuning. texel_tune.py owns setting the real
-numbers -- do not hand-adjust these from watching games. Register any new table you add
-here in texel_tune.py's get_tunable_tables() or it silently won't get tuned.
+Weights were seeded from public-style values, then tools/texel_tune.py moved the ones
+that quiet-position game-outcome data can tune honestly -- passed-pawn bonus by rank,
+doubled and isolated penalties (diag-10). Piece values and king safety stay at their
+seeds (that data drifts piece ratios low and zeroes king safety). Do not hand-adjust
+from watching games; add a new tunable term to _PARAMS in tools/texel_tune.py.
 
 evaluate() runs the numba-jitted path (_evaluate_jit, built from the kernels in the
 "Jitted evaluation" section). _evaluate_reference() is the pure-python equivalent, kept
@@ -192,10 +193,13 @@ PST_EG = {
     chess.QUEEN: _flip_ranks(QUEEN_EG), chess.KING: _flip_ranks(KING_EG),
 }
 
-# Pawn structure (centipawns).
-DOUBLED_PAWN_PENALTY = -12
-ISOLATED_PAWN_PENALTY = -10
-PASSED_PAWN_BONUS_BY_RANK = [0, 5, 10, 20, 35, 60, 100, 0]  # index = rank from own side
+# Pawn structure (centipawns). Passed-pawn / doubled / isolated Texel-tuned
+# (tools/texel_tune.py --positional-only) on ~42k quiet Carlsen + Lichess-2013
+# positions labelled by game outcome; diag-10. Piece values and king safety were
+# left at their seeds -- quiet-position WDL data can't tune those honestly.
+DOUBLED_PAWN_PENALTY = -17
+ISOLATED_PAWN_PENALTY = -25
+PASSED_PAWN_BONUS_BY_RANK = [0, 27, 46, 71, 106, 114, 115, 0]  # index = rank from own side
 
 # Mobility (centipawns per legal-attack-square, MG/EG).
 MOBILITY_MG = {chess.KNIGHT: 4, chess.BISHOP: 4, chess.ROOK: 2, chess.QUEEN: 1}
@@ -993,7 +997,8 @@ _warm_up()
 
 def _evaluate_reference(board: chess.Board) -> int:
     """Pure-python tapered eval -- the oracle evaluate() (the jitted path) is checked
-    against. Kept verbatim; tune weights here, and register new tables in texel_tune.py.
+    against. Kept verbatim; it reads the same module-level weight constants the jitted
+    kernels bake in, so a tools/texel_tune.py retune flows through both.
 
     Tapered eval, centipawns, from side-to-move's perspective (negamax convention). The
     search never calls this on a checkmate, so there is no is_checkmate() guard here.

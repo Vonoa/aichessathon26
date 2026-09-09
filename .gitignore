@@ -5,6 +5,10 @@ __pycache__/
 submission.zip
 *.pgn
 
+# Texel tuning: local datasets pasted in by hand, never shipped or committed (the
+# tuner lives at tools/texel_tune.py; provenance scripts are in versions/phase7/).
+tuning/
+
 # Phase 7: large intermediate data files, reconstructable from the pipeline scripts
 # + the (much smaller) final labelled dataset that IS kept for provenance.
 versions/phase7/raw_positions_lichess.tsv
