@@ -208,6 +208,34 @@ def test_futility_prunes_quiet_frontier_moves() -> None:
     assert with_nodes < without_nodes
 
 
+def test_late_move_reductions_cut_nodes() -> None:
+    # A wide, level middlegame: the log-formula reduction searches the tail of the
+    # quiet list shallower, so far fewer nodes for a score the re-search keeps honest.
+    board = chess.Board("r1bq1rk1/ppp2ppp/2np1n2/2b1p3/2B1P3/2NP1N2/PPP2PPP/R1BQ1RK1 w - - 0 7")
+    far = time.monotonic() + 120
+    window = (-search.MATE - 1, search.MATE + 1)
+
+    def run() -> tuple[int, int]:
+        search._reset_tt()
+        search._killers[:] = [0] * search._KILLER_SLOTS
+        search._hist[:] = [0] * 4096
+        search._tt_gen = (search._tt_gen + 1) & 0xFFFF
+        search._nodes = 0
+        bb, state = movegen.encode(board)
+        _, sc = search._search_root(bb, state, 7, far, 0, *window)
+        return sc, search._nodes
+
+    with_score, with_nodes = run()
+    saved = search._LMR_MIN_DEPTH
+    search._LMR_MIN_DEPTH = 99  # disables the `reduce` gate; every move searched full depth
+    try:
+        without_score, without_nodes = run()
+    finally:
+        search._LMR_MIN_DEPTH = saved
+    assert abs(with_score - without_score) <= 2 * search._CONTEMPT
+    assert with_nodes < without_nodes
+
+
 def test_seen_position_is_a_draw_at_the_horizon() -> None:
     # A position already seen in the game must score as a draw even at the horizon, not
     # be evaluated by material. With contempt a draw is not exactly 0.

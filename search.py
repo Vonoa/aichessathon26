@@ -17,6 +17,7 @@ Deterministic by construction: no RNG in the search, move ordering is a stable s
 the generator's fixed order, ties broken by first-seen. Same position + clock -> same move.
 """
 
+import math
 import os
 import time
 
@@ -49,6 +50,15 @@ _RFP_MAX_DEPTH = 6  # reverse-futility pruning only near the frontier
 _RFP_MARGIN = 75  # centipawns per ply the static eval must clear beta by
 _FUTILITY_MAX_DEPTH = 2  # futility-prune quiet moves only at the frontier
 _FUTILITY_MARGIN = 120  # centipawns per ply a quiet move must come within alpha
+
+# Late-move reduction depth by [depth][move_index] (both clamped to 63). The classic
+# log formula -- reduce more the deeper the search and the later the move. The call
+# site shaves one off on the PV and for killers, floors at 0, and caps it so the
+# reduced re-search is always at least one ply (never straight into quiescence).
+_LMR_TABLE: list[list[int]] = [[0] * 64 for _ in range(64)]
+for _d in range(1, 64):
+    for _m in range(1, 64):
+        _LMR_TABLE[_d][_m] = int(0.8 + math.log(_d) * math.log(_m) / 2.5)
 
 # Syzygy endgame tablebases. When the board is down to this few men and ./syzygy holds
 # the files, search_move picks the move straight from the tables (WDL for the outcome,
@@ -442,7 +452,20 @@ def _negamax(
                 and move_index >= _LMR_MIN_MOVE
                 and not gives_check
             )
-            r = (2 if move_index >= _LMR_MIN_MOVE + 3 else 1) if reduce else 0
+            if reduce:
+                # conditional expressions, not min(): a builtin call per reduced move
+                # is ~15% of a cheap endgame node (see tools/bench.py rook endgame).
+                di = depth if depth < 64 else 63
+                mi = move_index if move_index < 64 else 63
+                r = _LMR_TABLE[di][mi]
+                if beta - alpha > 1:  # on the PV, reduce one less
+                    r -= 1
+                if r < 1:
+                    r = 0
+                elif r > depth - 2:
+                    r = depth - 2
+            else:
+                r = 0
             score = -_negamax(bb, state, depth - 1 - r, ply + 1, -alpha - 1, -alpha, deadline)
             if score > alpha and (r > 0 or score < beta):
                 score = -_negamax(bb, state, depth - 1, ply + 1, -beta, -alpha, deadline)
