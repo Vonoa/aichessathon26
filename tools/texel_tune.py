@@ -46,6 +46,7 @@ import numpy.typing as npt
 from numba import njit
 
 import evaluate as ev
+import movegen
 
 # --- weight-vector layout -----------------------------------------------------
 # One flat int16 vector. Index constants are plain ints, which numba is happy to
@@ -336,16 +337,20 @@ def _eval_batch(
 # --- data -------------------------------------------------------------------
 
 
-def load_dataset(path: Path, limit: int | None) -> tuple[list[str], npt.NDArray[np.float64]]:
-    """Accepts either row format, auto-detected by column count, and returns
-    targets normalised to White's point of view in [0, 1]:
+def load_dataset(
+    path: Path, limit: int | None
+) -> tuple[list[str], npt.NDArray[np.float64], list[str]]:
+    """Accepts either row format, auto-detected by column count. Returns the FEN list,
+    targets normalised to White's point of view in [0, 1], and a game-id per row (""
+    when the format carries none) so the train/val split can avoid cross-game leakage:
 
       fen <TAB> target                 -- target already White-POV (label.py output)
       game_id <TAB> fen <TAB> result   -- result is side-to-move-POV game outcome
-                                          (tuning/carlsen/*.tsv); flipped to White here
+                                          (tuning/*.tsv); flipped to White here
     """
     fens: list[str] = []
     targets: list[float] = []
+    game_ids: list[str] = []
     with path.open(encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
@@ -353,39 +358,65 @@ def load_dataset(path: Path, limit: int | None) -> tuple[list[str], npt.NDArray[
                 continue
             parts = line.split("\t")
             if len(parts) == 3:
-                _game_id, fen, result = parts
+                game_id, fen, result = parts
                 value = float(result)
                 if fen.split()[1] != "w":  # result is from the mover's side
                     value = 1.0 - value
             elif len(parts) == 2:
-                fen, raw = parts
+                game_id, fen, raw = "", parts[0], parts[1]
                 value = float(raw)
             else:
                 continue
             fens.append(fen)
             targets.append(value)
+            game_ids.append(game_id)
             if limit is not None and len(fens) >= limit:
                 break
-    return fens, np.asarray(targets, dtype=np.float64)
+    return fens, np.asarray(targets, dtype=np.float64), game_ids
+
+
+_QBUF = np.empty(256, dtype=np.int32)
+
+
+def _is_quiet(bb: npt.NDArray[np.uint64], state: npt.NDArray[np.int64]) -> bool:
+    """No SEE>=0 capture available for the side to move -- the standard Texel filter.
+    A position with a hanging piece has a static eval that lies about its true value,
+    so tuning on it drifts weights (v1 saw piece values fall this way).
+    """
+    turn = int(state[0])
+    enemy = int(movegen._occ_of(bb, 1 - turn))
+    n = movegen._gen_legal(bb, state, _QBUF)
+    for i in range(n):
+        code = int(_QBUF[i])
+        to = (code >> 6) & 0x3F
+        flag = (code >> 15) & 7
+        if (flag == 2 or ((enemy >> to) & 1)) and int(movegen._see(bb, turn, code)) >= 0:
+            return False
+    return True
 
 
 def encode_dataset(
     fens: list[str],
+    quiet_filter: bool,
 ) -> tuple[
     npt.NDArray[np.uint64],
     npt.NDArray[np.uint64],
     npt.NDArray[np.int64],
     npt.NDArray[np.int64],
+    npt.NDArray[np.int32],
     npt.NDArray[np.bool_],
 ]:
-    """FEN list -> stacked (pieces, occ, white_king, black_king) arrays + a keep
-    mask (positions evaluate() would special-case, or that have no king, drop out).
+    """FEN list -> stacked (pieces, occ, white_king, black_king, shipped_eval) arrays and
+    a keep mask. Drops: unparseable, no king, in check, stalemate, insufficient material,
+    and -- when quiet_filter -- any position with a SEE>=0 capture on the board. The
+    shipped_eval column (seed weights, White POV) feeds the optional WDL blend.
     """
     n = len(fens)
     pieces = np.zeros((n, 2, 6), dtype=np.uint64)
     occ = np.zeros((n, 3), dtype=np.uint64)
     wk = np.zeros(n, dtype=np.int64)
     bk = np.zeros(n, dtype=np.int64)
+    seval = np.zeros(n, dtype=np.int32)
     keep = np.ones(n, dtype=np.bool_)
     for i, fen in enumerate(fens):
         try:
@@ -404,12 +435,20 @@ def encode_dataset(
         ):
             keep[i] = False
             continue
+        bb, state = movegen.encode(board)
+        if quiet_filter and not _is_quiet(bb, state):
+            keep[i] = False
+            continue
         p, o, _ = ev._encode(board)
         pieces[i] = p
         occ[i] = o
         wk[i] = wksq
         bk[i] = bksq
-    return pieces, occ, wk, bk, keep
+        shipped = ev.evaluate(board)
+        seval[i] = shipped if board.turn == chess.WHITE else -shipped
+        if i % 200_000 == 0 and i:
+            print(f"  encoded {i}/{n} ...")
+    return pieces, occ, wk, bk, seval, keep
 
 
 def _assert_replica_matches_shipped(
@@ -418,25 +457,31 @@ def _assert_replica_matches_shipped(
     occ: npt.NDArray[np.uint64],
     wk: npt.NDArray[np.int64],
     bk: npt.NDArray[np.int64],
+    sample: int = 6000,
 ) -> None:
+    """Check the njit replica reproduces evaluate.evaluate on a random sample (the full
+    2M-row loop of chess.Board + evaluate would be minutes) at the seed weights, so the
+    optimum found is valid for the shipped eval."""
     seed = seed_vector()
     out = np.zeros(len(fens), dtype=np.float64)
     _eval_batch(pieces, occ, wk, bk, seed, out)
+    rng = np.random.default_rng(1)
+    idx = rng.choice(len(fens), size=min(sample, len(fens)), replace=False)
     bad = 0
-    for i, fen in enumerate(fens):
-        board = chess.Board(fen)
+    for i in idx:
+        board = chess.Board(fens[i])
         shipped = ev.evaluate(board)
         white_pov = shipped if board.turn == chess.WHITE else -shipped
         if int(out[i]) != white_pov:
             bad += 1
             if bad <= 5:
-                print(f"  replica mismatch: {fen}  replica={int(out[i])} shipped={white_pov}")
+                print(f"  replica mismatch: {fens[i]}  replica={int(out[i])} shipped={white_pov}")
     if bad:
         raise SystemExit(
-            f"replica disagrees with evaluate.evaluate on {bad}/{len(fens)} positions "
+            f"replica disagrees with evaluate.evaluate on {bad}/{len(idx)} sampled positions "
             "-- the kernels in evaluate.py changed; update the replica in this file."
         )
-    print(f"replica == evaluate.evaluate on all {len(fens)} positions (seed weights)")
+    print(f"replica == evaluate.evaluate on {len(idx)} sampled positions (seed weights)")
 
 
 # --- optimiser ------------------------------------------------------------------
@@ -482,6 +527,7 @@ def tune(
     start_err = mse(targets, out, k)
     best_err = start_err
     steps = {name: step for name, _idx, _lo, _hi, step in _PARAMS}
+    momentum = {name: 1 for name, *_ in _PARAMS}  # last successful direction, tried first
     print(f"K={k:.0f}  start MSE={start_err:.6f}  ({len(targets)} positions)")
 
     for sweep in range(max_sweeps):
@@ -490,7 +536,8 @@ def tune(
             step = steps[name]
             if step < 1:
                 continue
-            for delta in (step, -step):
+            first = momentum[name]
+            for delta in (first * step, -first * step):
                 original = int(w[idx])
                 candidate = original + delta
                 if candidate < lo or candidate > hi:
@@ -501,6 +548,7 @@ def tune(
                 if err + 1e-12 < best_err:
                     best_err = err
                     improved = True
+                    momentum[name] = 1 if delta > 0 else -1
                     break
                 w[idx] = original
         _eval_batch(pieces, occ, wk, bk, w, out)
@@ -575,6 +623,21 @@ def main() -> None:
         help="tune only terms with honest quiet-position signal (drops piece values "
         "and king safety -- see _UNSAFE_FOR_QUIET_WDL)",
     )
+    parser.add_argument(
+        "--blend",
+        type=float,
+        default=1.0,
+        metavar="LAMBDA",
+        help="target = LAMBDA*game_result + (1-LAMBDA)*sigmoid(shipped_eval/400). "
+        "1.0 (default) = pure game outcome; 0.6-0.7 adds per-position signal that "
+        "steadies the fit. The eval half is our own, so keep LAMBDA >= ~0.5.",
+    )
+    parser.add_argument(
+        "--no-quiet-filter",
+        action="store_true",
+        help="keep positions with a SEE>=0 capture on the board (default drops them; "
+        "tuning on tactically-unresolved positions drifts weights)",
+    )
     args = parser.parse_args()
 
     global _PARAMS
@@ -594,37 +657,55 @@ def main() -> None:
 
     hasher = hashlib.sha256()
     fens: list[str] = []
+    game_ids: list[str] = []
     targets_list: list[npt.NDArray[np.float64]] = []
     for path in files:
         hasher.update(path.read_bytes())
-        part_fens, part_targets = load_dataset(path, None)
+        part_fens, part_targets, part_ids = load_dataset(path, None)
         fens.extend(part_fens)
+        game_ids.extend(f"{path.stem}:{g}" for g in part_ids)
         targets_list.append(part_targets)
         print(f"  {path}  rows={len(part_fens)}")
     targets = np.concatenate(targets_list)
     if args.limit is not None and len(fens) > args.limit:
-        fens = fens[: args.limit]
-        targets = targets[: args.limit]
+        fens, game_ids, targets = fens[: args.limit], game_ids[: args.limit], targets[: args.limit]
     digest = hasher.hexdigest()[:16]
     dataset_dir = files[0].parent
     print(f"{len(files)} file(s)  sha256[:16]={digest}  rows={len(fens)}")
 
     t0 = time.time()
-    pieces, occ, wk, bk, keep = encode_dataset(fens)
+    pieces, occ, wk, bk, seval, keep = encode_dataset(fens, not args.no_quiet_filter)
     fens = [f for f, flag in zip(fens, keep, strict=True) if flag]
-    targets = targets[keep]
+    game_ids = [g for g, flag in zip(game_ids, keep, strict=True) if flag]
+    targets, seval = targets[keep], seval[keep]
     pieces, occ, wk, bk = pieces[keep], occ[keep], wk[keep], bk[keep]
+    filt = "quiet-filtered" if not args.no_quiet_filter else "no quiet filter"
     print(
         f"encoded {len(fens)} usable positions in {time.time() - t0:.1f}s "
-        f"({int(keep.sum())} kept, {int((~keep).sum())} dropped: check/terminal/no-king)"
+        f"({int((~keep).sum())} dropped: check/terminal/no-king/{filt})"
     )
+
+    if args.blend < 1.0:
+        wdl = targets.copy()
+        targets = args.blend * wdl + (1.0 - args.blend) * (
+            1.0 / (1.0 + np.exp(-seval.astype(np.float64) / 400.0))
+        )
+        print(f"blended targets: {args.blend:.2f}*WDL + {1 - args.blend:.2f}*sigmoid(eval/400)")
 
     _assert_replica_matches_shipped(fens, pieces, occ, wk, bk)
 
+    # Split so no game straddles train/val. Rows from format-2 files (no game id) fall
+    # back to a per-row id, i.e. a plain random split for those.
     rng = np.random.default_rng(args.seed)
-    order = rng.permutation(len(fens))
-    n_val = int(len(fens) * args.val_frac)
-    val_idx, train_idx = order[:n_val], order[n_val:]
+    uniq = sorted(set(game_ids))
+    val_games = set(
+        rng.choice(len(uniq), size=max(1, int(len(uniq) * args.val_frac)), replace=False)
+    )
+    val_lut = {uniq[i] for i in val_games}
+    is_val = np.array([g in val_lut for g in game_ids])
+    val_idx = np.nonzero(is_val)[0]
+    train_idx = np.nonzero(~is_val)[0]
+    print(f"{len(uniq)} groups; train {len(train_idx)}  val {len(val_idx)}")
 
     def split(a: npt.NDArray) -> tuple[npt.NDArray, npt.NDArray]:
         return a[train_idx], a[val_idx]
@@ -662,6 +743,8 @@ def main() -> None:
             {
                 "dataset": [str(p) for p in files],
                 "dataset_sha256_16": digest,
+                "blend_lambda": args.blend,
+                "quiet_filter": not args.no_quiet_filter,
                 "n_positions": len(fens),
                 "n_train": len(train_idx),
                 "n_val": len(val_idx),
