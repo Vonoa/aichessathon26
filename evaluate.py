@@ -202,8 +202,11 @@ ISOLATED_PAWN_PENALTY = -25
 PASSED_PAWN_BONUS_BY_RANK = [0, 27, 46, 71, 106, 114, 115, 0]  # index = rank from own side
 
 # Mobility (centipawns per legal-attack-square, MG/EG).
-MOBILITY_MG = {chess.KNIGHT: 4, chess.BISHOP: 4, chess.ROOK: 2, chess.QUEEN: 1}
-MOBILITY_EG = {chess.KNIGHT: 4, chess.BISHOP: 5, chess.ROOK: 3, chess.QUEEN: 2}
+# Texel v2 (tools/texel_tune.py, ~2.6M quiet Lichess+Carlsen positions, WDL/eval blend)
+# wanted mobility up, EG most of all -- "active pieces beat shuffling ones" (rounds 79/83).
+# The tune's raw EG values (R 10, Q 7) inflate; damped here, direction kept. diag-16.
+MOBILITY_MG = {chess.KNIGHT: 4, chess.BISHOP: 5, chess.ROOK: 3, chess.QUEEN: 1}
+MOBILITY_EG = {chess.KNIGHT: 6, chess.BISHOP: 5, chess.ROOK: 7, chess.QUEEN: 5}
 
 # KX-vs-K mate driver (centipawns). Only active when one side is a bare king: push the
 # lone king off the centre toward a corner, and march the winning king up to support the

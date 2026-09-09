@@ -26,7 +26,7 @@ import re
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 _NUM = r"([+-]?\d+(?:\.\d+)?)"
@@ -113,8 +113,24 @@ def main() -> None:
     )
     started = time.time()
 
+    rows: list[dict] = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        rows = list(ex.map(lambda o: _run_arena(agent, o, games, a.base_ms, a.increment_ms), pool))
+        futs = {ex.submit(_run_arena, agent, o, games, a.base_ms, a.increment_ms): o for o in pool}
+        pending = set(futs)
+        while pending:
+            done, pending = wait(pending, timeout=60, return_when=FIRST_COMPLETED)
+            mins = (time.time() - started) / 60
+            for f in done:
+                row = f.result()
+                rows.append(row)
+                tag = (
+                    "FAILED"
+                    if "error" in row
+                    else (f"Elo {row['elo']:+.0f}" if "elo" in row else "done")
+                )
+                print(f"  [{mins:.0f}m] {Path(futs[f]).name}: {tag}")
+            if pending:
+                print(f"  [{mins:.0f}m] {len(pending)}/{len(pool)} arenas still running")
 
     tot = [0, 0, 0]
     print(f"\n  {'opponent':22s} {'W/D/L':>12s} {'score':>7s} {'Elo':>7s}   95% interval")
