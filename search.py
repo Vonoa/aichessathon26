@@ -47,6 +47,8 @@ _NMP_MIN_DEPTH = 3  # only try a null move with at least this much depth left
 _SEE_QS_MARGIN = 90  # quiescence keeps a capture unless SEE is worse than -this
 _RFP_MAX_DEPTH = 6  # reverse-futility pruning only near the frontier
 _RFP_MARGIN = 75  # centipawns per ply the static eval must clear beta by
+_FUTILITY_MAX_DEPTH = 2  # futility-prune quiet moves only at the frontier
+_FUTILITY_MARGIN = 120  # centipawns per ply a quiet move must come within alpha
 
 # Syzygy endgame tablebases. When the board is down to this few men and ./syzygy holds
 # the files, search_move picks the move straight from the tables (WDL for the outcome,
@@ -417,6 +419,22 @@ def _negamax(
             score = -_negamax(bb, state, depth - 1, ply + 1, -beta, -alpha, deadline)
         else:
             gives_check = _in_check(bb, state)  # opponent now to move
+
+            # Futility pruning: at the frontier in a non-PV node, a quiet non-checking
+            # move whose static eval is a full margin below alpha cannot raise it --
+            # skip it. Held off in check and near mate scores.
+            if (
+                quiet
+                and not gives_check
+                and not in_check
+                and beta - alpha == 1
+                and depth <= _FUTILITY_MAX_DEPTH
+                and abs(alpha) < _MATE_THRESHOLD
+                and static_eval + _FUTILITY_MARGIN * depth <= alpha
+            ):
+                movegen._unmake(bb, state, code, undo)
+                continue
+
             reduce = (
                 quiet
                 and not in_check

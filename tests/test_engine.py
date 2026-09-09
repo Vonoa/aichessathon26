@@ -133,13 +133,21 @@ def test_null_move_pruning_cuts_nodes() -> None:
         _, sc = search._search_root(bb, state, depth, far, 0, *window)
         return sc, search._nodes
 
-    with_score, with_nodes = run(6)
-    saved = search._NMP_MIN_DEPTH
-    search._NMP_MIN_DEPTH = 99
+    # Hold the other two pruners out so this isolates NMP -- with futility + RFP live,
+    # they already thin the frontier enough that NMP's marginal saving can go negative.
+    saved_rfp, saved_fut = search._RFP_MAX_DEPTH, search._FUTILITY_MAX_DEPTH
+    search._RFP_MAX_DEPTH = 0
+    search._FUTILITY_MAX_DEPTH = 0
     try:
-        without_score, without_nodes = run(6)
+        with_score, with_nodes = run(6)
+        saved = search._NMP_MIN_DEPTH
+        search._NMP_MIN_DEPTH = 99
+        try:
+            without_score, without_nodes = run(6)
+        finally:
+            search._NMP_MIN_DEPTH = saved
     finally:
-        search._NMP_MIN_DEPTH = saved
+        search._RFP_MAX_DEPTH, search._FUTILITY_MAX_DEPTH = saved_rfp, saved_fut
     assert abs(with_score - without_score) <= search._CONTEMPT
     assert with_nodes < without_nodes
 
@@ -169,6 +177,34 @@ def test_reverse_futility_prunes_nodes() -> None:
     finally:
         search._RFP_MAX_DEPTH = saved
     assert with_score > 300 and without_score > 300  # the win survives the pruning
+    assert with_nodes < without_nodes
+
+
+def test_futility_prunes_quiet_frontier_moves() -> None:
+    # White is a rook and four pawns down; at the frontier its quiet king shuffles are
+    # a full margin below alpha and cannot raise it, so futility pruning skips them.
+    board = chess.Board("4k3/7p/8/8/8/8/ppp5/1K1r4 w - - 0 1")
+    far = time.monotonic() + 120
+    window = (-search.MATE - 1, search.MATE + 1)
+
+    def run() -> tuple[int, int]:
+        search._reset_tt()
+        search._killers[:] = [0] * search._KILLER_SLOTS
+        search._hist[:] = [0] * 4096
+        search._tt_gen = (search._tt_gen + 1) & 0xFFFF
+        search._nodes = 0
+        bb, state = movegen.encode(board)
+        _, sc = search._search_root(bb, state, 6, far, 0, *window)
+        return sc, search._nodes
+
+    with_score, with_nodes = run()
+    saved = search._FUTILITY_MAX_DEPTH
+    search._FUTILITY_MAX_DEPTH = 0  # _negamax never reaches the block with depth <= 0
+    try:
+        without_score, without_nodes = run()
+    finally:
+        search._FUTILITY_MAX_DEPTH = saved
+    assert with_score < -300 and without_score < -300  # still losing, pruning didn't lie
     assert with_nodes < without_nodes
 
 
