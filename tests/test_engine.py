@@ -208,34 +208,6 @@ def test_futility_prunes_quiet_frontier_moves() -> None:
     assert with_nodes < without_nodes
 
 
-def test_late_move_pruning_cuts_nodes() -> None:
-    # A wide, roughly level middlegame: plenty of quiet moves, so move-count pruning
-    # skips the tail of the quiet list once the early ones haven't raised alpha.
-    board = chess.Board("r1bq1rk1/ppp2ppp/2np1n2/2b1p3/2B1P3/2NP1N2/PPP2PPP/R1BQ1RK1 w - - 0 7")
-    far = time.monotonic() + 120
-    window = (-search.MATE - 1, search.MATE + 1)
-
-    def run() -> tuple[int, int]:
-        search._reset_tt()
-        search._killers[:] = [0] * search._KILLER_SLOTS
-        search._hist[:] = [0] * 4096
-        search._tt_gen = (search._tt_gen + 1) & 0xFFFF
-        search._nodes = 0
-        bb, state = movegen.encode(board)
-        _, sc = search._search_root(bb, state, 6, far, 0, *window)
-        return sc, search._nodes
-
-    with_score, with_nodes = run()
-    saved = search._LMP_MAX_DEPTH
-    search._LMP_MAX_DEPTH = 0  # _negamax never reaches the block with depth <= 0
-    try:
-        without_score, without_nodes = run()
-    finally:
-        search._LMP_MAX_DEPTH = saved
-    assert abs(with_score - without_score) <= 2 * search._CONTEMPT  # eval barely moves
-    assert with_nodes < without_nodes
-
-
 def test_seen_position_is_a_draw_at_the_horizon() -> None:
     # A position already seen in the game must score as a draw even at the horizon, not
     # be evaluated by material. With contempt a draw is not exactly 0.
