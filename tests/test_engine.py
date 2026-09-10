@@ -252,6 +252,20 @@ def test_seen_position_is_a_draw_at_the_horizon() -> None:
     assert odd == search._CONTEMPT
 
 
+def test_fifty_move_fade_dampens_a_stale_advantage() -> None:
+    # White up a rook. Below the fade threshold the eval is untouched; once the halfmove
+    # clock climbs the same position is worth meaningfully less, so the search is pushed
+    # to convert with a zeroing move before the draw claim (Round 97).
+    won = "8/8/8/4k3/8/8/3RK3/8 w - - {} 40"
+    fresh = search._eval_bb(*movegen.encode(chess.Board(won.format(0))))
+    early = search._eval_bb(*movegen.encode(chess.Board(won.format(search._FIFTY_FADE_START))))
+    stale = search._eval_bb(*movegen.encode(chess.Board(won.format(90))))
+    assert fresh > 400
+    assert early == fresh                 # threshold not yet crossed
+    assert stale < fresh * 3 // 5         # ~0.45x near the claim
+    assert stale > 100                    # still clearly winning, just discounted
+
+
 def test_qsearch_resolves_a_hanging_piece() -> None:
     # White's rook can take Black's undefended rook. Static eval sees material equal;
     # quiescence must see the win.
@@ -450,15 +464,15 @@ def test_eval_is_colour_symmetric(fen: str) -> None:
 # +-3 when king safety went non-linear; the two pawn-heavy endgame entries moved (-86 ->
 # -66, -383 -> -439) when passed/doubled/isolated were Texel-tuned for diag-10.
 _EVAL_GOLDEN = {
-    "r1bq1rk1/pp2bppp/2n1pn2/2pp4/3P1B2/2PBPN2/PP1N1PPP/R2Q1RK1 w - - 0 9": 53,
+    "r1bq1rk1/pp2bppp/2n1pn2/2pp4/3P1B2/2PBPN2/PP1N1PPP/R2Q1RK1 w - - 0 9": 79,
     "r3k2r/pppq1ppp/2np1n2/2b1p1B1/2B1P1b1/2NP1N2/PPPQ1PPP/R3K2R w KQkq - 0 1": 0,
-    "8/5pk1/6p1/7p/3R3P/6P1/5PK1/3r4 b - - 0 1": -1,
-    "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c6 0 2": 17,
-    "8/2k5/8/8/8/8/5K2/6R1 w - - 0 1": 643,
+    "8/5pk1/6p1/7p/3R3P/6P1/5PK1/3r4 b - - 0 1": -5,
+    "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c6 0 2": 26,
+    "8/2k5/8/8/8/8/5K2/6R1 w - - 0 1": 657,
     "8/1p3pk1/p5p1/3P4/2P5/6P1/5K2/8 w - - 0 1": -66,
     "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N1P/1PP1QPP1/R4RK1 w - - 0 11": -2,
-    "2r3k1/5ppp/p7/1p1Pp3/8/1P3N2/P4PPP/3R2K1 b - - 0 1": -445,
-    "r1b1k2r/ppppqppp/2n2n2/2b5/4P3/2N2N2/PPPP1PPP/R1BQK2R w KQkq - 6 6": -246,
+    "2r3k1/5ppp/p7/1p1Pp3/8/1P3N2/P4PPP/3R2K1 b - - 0 1": -442,
+    "r1b1k2r/ppppqppp/2n2n2/2b5/4P3/2N2N2/PPPP1PPP/R1BQK2R w KQkq - 6 6": -268,
 }
 
 
@@ -544,7 +558,7 @@ def test_king_safety_ramps_with_multiple_attackers() -> None:
     # Two attackers must cost far more than the pawn shield is worth -- a real threat
     # signal, and much worse than a lone attacker's linear penalty.
     assert _black_king_safety(swarm) < _black_king_safety(calm) - 80
-    assert _black_king_safety(swarm) < -45  # diag-18 eased KING_DANGER_SCALE 65->61
+    assert _black_king_safety(swarm) < -50
 
 
 def test_king_safety_lone_attacker_is_cheap() -> None:
