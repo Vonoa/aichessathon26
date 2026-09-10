@@ -199,12 +199,7 @@ PST_EG = {
 # left at their seeds -- quiet-position WDL data can't tune those honestly.
 DOUBLED_PAWN_PENALTY = -17
 ISOLATED_PAWN_PENALTY = -25
-# diag-20: steepen the tail. The old curve topped out at 115 for a pawn one square
-# from promoting -- only +9 over rank 5, so we neither pushed our own runners nor
-# feared the enemy's. Rated rounds 88/89 were lost to an enemy passer walking in
-# unchallenged; 95 was a +1 pawn shuffled to a threefold. Symmetric eval, so this
-# both drives our passers and respects theirs. Ranks 1-4 barely move.
-PASSED_PAWN_BONUS_BY_RANK = [0, 25, 44, 70, 108, 145, 205, 0]  # index = rank from own side
+PASSED_PAWN_BONUS_BY_RANK = [0, 27, 46, 71, 106, 114, 115, 0]  # index = rank from own side
 
 # Mobility (centipawns per legal-attack-square, MG/EG).
 # Texel v2 (tools/texel_tune.py, ~2.6M quiet Lichess+Carlsen positions, WDL/eval blend)
