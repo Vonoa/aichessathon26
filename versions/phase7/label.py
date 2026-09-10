@@ -67,24 +67,32 @@ def label_dataset(
 
 def make_engine_shallow_eval(budget_s: float = 0.3, clip_cp: float = 3000.0):
     """The real shallow eval this file's docstring calls for: the current
-    classical engine (main/search.py, diag-8: persistent TT, PVS, aspiration
-    windows, Syzygy), run through its own iterative-deepening loop under a
-    wall-clock budget rather than a fixed depth cap. docs/phase7-nnue.md
-    calls for "depth 6-8, fast, noisy" -- but a raw fixed-depth call on this
-    engine can run away in sharp, wide-open positions (no time bound at all),
-    while a time budget reaches a comparable real depth in ordinary quiet
-    middlegames and stays bounded everywhere, including the sharp ones. Mate
-    scores are clipped to clip_cp before the sigmoid conversion in
-    label_dataset, since an unclipped mate score (+-1,000,000) overflows
-    math.exp there.
+    classical engine (repo root search.py -- diag-19 as of this writing:
+    persistent TT, PVS/aspiration, jitted bitboard movegen, NMP/RFP/LMP,
+    SEE-filtered quiescence, Syzygy), run through its own iterative-deepening
+    loop under a wall-clock budget rather than a fixed depth cap. Whichever
+    diag root search.py actually is when this runs IS the teacher -- keep
+    this branch merged with main so labelling never falls behind the engine's
+    own progress the way it silently did for this project's first several
+    labelling runs (root search.py sat on a pre-diag-9 fork the whole time).
+    docs/phase7-nnue.md calls for "depth 6-8, fast, noisy" -- but a raw
+    fixed-depth call on this engine can run away in sharp, wide-open
+    positions (no time bound at all), while a time budget reaches a
+    comparable real depth in ordinary quiet middlegames and stays bounded
+    everywhere, including the sharp ones. Mate scores are clipped to clip_cp
+    before the sigmoid conversion in label_dataset, since an unclipped mate
+    score (+-1,000,000) overflows math.exp there.
 
-    Reaches into search.py's module-level globals (_killers/_hist/_seen) the
-    same way search_move() does, and resets them before every call --
-    labelling calls are on independent positions, so nothing should carry
-    over between them the way search state carries across moves in one game.
-    The persistent transposition table is deliberately NOT reset -- it is a
-    plain cache keyed by position hash, harmless and mildly helpful to leave
-    warm across many independent label() calls in one process.
+    The search runs on movegen.py's jitted (bb, state) substrate, not
+    chess.Board -- this only touches chess.Board to encode the starting
+    position and to check for no-legal-moves (checkmate/stalemate). Reaches
+    into search.py's module-level globals (_killers/_hist/_seen/_tt_gen) the
+    same way search_move() does, and resets them before every call the same
+    way -- labelling calls are on independent positions, so nothing should
+    carry over between them the way search state carries across moves in one
+    game. The persistent transposition table is deliberately NOT reset -- it
+    is a plain cache keyed by position hash, harmless and mildly helpful to
+    leave warm across many independent label() calls in one process.
     """
     import sys
     import time
@@ -93,6 +101,7 @@ def make_engine_shallow_eval(budget_s: float = 0.3, clip_cp: float = 3000.0):
     repo_root = Path(__file__).resolve().parents[2]
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
+    import movegen as engine_movegen
     import search as engine_search
 
     def _eval(fen: str) -> float:
@@ -100,25 +109,24 @@ def make_engine_shallow_eval(budget_s: float = 0.3, clip_cp: float = 3000.0):
         legal = list(board.legal_moves)
         if not legal:
             return 0.0  # checkmate/stalemate; the outcome label already carries this
-        root_is_white = board.turn == chess.WHITE  # captured before the search can touch
-        # the board -- a _Timeout unwinds through _negamax's recursion without popping
-        # (search.py's own search_move() docstring/comment says so), so board.turn after
-        # the loop can be some mid-tree position's turn, not this FEN's. Reading it only
-        # here, before any push happens, is what search_move() itself does and why.
+        root_is_white = board.turn == chess.WHITE
+
+        bb0, state0 = engine_movegen.encode(board)
 
         engine_search._nodes = 0
         engine_search._seen = frozenset()
-        engine_search._killers[:] = [None] * len(engine_search._killers)
+        engine_search._tt_gen = (engine_search._tt_gen + 1) & 0xFFFF
+        engine_search._killers[:] = [0] * len(engine_search._killers)
         engine_search._hist[:] = [0] * 4096
 
         deadline = time.monotonic() + budget_s
-        best = legal[0]
+        best_code = 0  # 0 = "no move-ordering hint yet", same sentinel search_move() uses
         score = 0
         alpha, beta = -engine_search.MATE - 1, engine_search.MATE + 1
         for depth in range(1, 9):  # 8 plies is already deeper than this budget usually reaches
             try:
-                best, score = engine_search._aspiration_search(
-                    board, depth, deadline, best, alpha, beta
+                best_code, score = engine_search._aspiration_search(
+                    bb0, state0, depth, deadline, best_code, alpha, beta
                 )
             except engine_search._Timeout:
                 break

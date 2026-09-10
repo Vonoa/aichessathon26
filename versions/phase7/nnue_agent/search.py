@@ -53,6 +53,15 @@ _RFP_MARGIN = 75  # centipawns per ply the static eval must clear beta by
 _FUTILITY_MAX_DEPTH = 2  # futility-prune quiet moves only at the frontier
 _FUTILITY_MARGIN = 120  # centipawns per ply a quiet move must come within alpha
 
+# Fifty-move-rule damping. Once a line has gone this many plies with no pawn move or
+# capture, the position is drifting toward the draw claim, so its eval is faded toward
+# zero -- linearly, reaching ~0.36x as the halfmove clock nears 100. This makes the
+# search treat aimless shuffling of a won position as a loss of value and steer toward a
+# zeroing move (pawn break, trade) while the edge is still real. Below the threshold the
+# eval is untouched. (Round 97: a +400 rook-up game shuffled straight into a threefold
+# draw -- the eval bled from +399 to -25 over ~18 quiet moves with no course correction.)
+_FIFTY_FADE_START = 30
+
 # Late-move reduction depth by [depth][move_index] (both clamped to 63). The classic
 # log formula -- reduce more the deeper the search and the later the move. The call
 # site shaves one off on the PV and for killers, floors at 0, and caps it so the
@@ -104,8 +113,8 @@ _PATH: npt.NDArray[np.uint64] = np.zeros(_MAX_PLY, dtype=np.uint64)  # zobrist k
 # per game resets it for free; tests call _reset_tt(). Two flat uint64 arrays, no
 # per-entry Python objects: an unbounded dict here churns GC and eats the 2 GB budget
 # (docs/PLAN.md, Phase 4). Open-addressed, one probe at slot = key & mask.
-_TT_BITS = 22
-_TT_SIZE = 1 << _TT_BITS  # 4,194,304 slots; 64 MB for the pair of arrays
+_TT_BITS = 24
+_TT_SIZE = 1 << _TT_BITS  # 16,777,216 slots; 256 MB for the pair (of a 2 GB budget)
 _TT_MASK = _TT_SIZE - 1
 _TT_VALUE_MAX = 30_000  # values outside +-this are not stored: they cannot fit the 16-bit
 #                         field and a real eval score never comes near it anyway. This
@@ -158,9 +167,14 @@ class _Timeout(Exception):
 def _eval_bb(bb: npt.NDArray[np.uint64], state: npt.NDArray[np.int64]) -> int:
     """Static eval from the side-to-move's point of view -- the NNUE net's running
     incremental accumulator, kept in sync with (bb, state) by _acc.push_bb()/pop()
-    around every movegen._make()/_unmake() call below. Ignores bb/state directly:
-    the accumulator already reflects the current position from set_root() + pushes."""
-    return _acc.evaluate_cp_bb(state)
+    around every movegen._make()/_unmake() call below. Keeps main's fifty-move eval
+    fade applied on top -- that's a property of any static eval near the fifty-move
+    mark, not something specific to the classical hand-tuned terms it was added for."""
+    score = _acc.evaluate_cp_bb(state)
+    half = int(state[3])
+    if half > _FIFTY_FADE_START:
+        score = score * max(8, 140 - half) // 110
+    return score
 
 
 def _in_check(bb: npt.NDArray[np.uint64], state: npt.NDArray[np.int64]) -> bool:
