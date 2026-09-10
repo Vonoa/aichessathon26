@@ -205,12 +205,8 @@ PASSED_PAWN_BONUS_BY_RANK = [0, 27, 46, 71, 106, 114, 115, 0]  # index = rank fr
 # Texel v2 (tools/texel_tune.py, ~2.6M quiet Lichess+Carlsen positions, WDL/eval blend)
 # wanted mobility up, EG most of all -- "active pieces beat shuffling ones" (rounds 79/83).
 # The tune's raw EG values (R 10, Q 7) inflate; damped here, direction kept. diag-16.
-# diag-18: MG mobility down (bishop 5->3, rook 3->2, queen 1->0), EG rook 7->6. The
-# GM-move policy tune (tools/policy_tune.py, 3 settings, 32k games) robustly said MG
-# mobility was over-weighted -- opposite of the Texel-v2 diag-16 bump (+19 only), so
-# the gauntlet vs diag-17 settles which tuner is right on this term.
-MOBILITY_MG = {chess.KNIGHT: 4, chess.BISHOP: 3, chess.ROOK: 2, chess.QUEEN: 0}
-MOBILITY_EG = {chess.KNIGHT: 6, chess.BISHOP: 5, chess.ROOK: 6, chess.QUEEN: 5}
+MOBILITY_MG = {chess.KNIGHT: 4, chess.BISHOP: 5, chess.ROOK: 3, chess.QUEEN: 1}
+MOBILITY_EG = {chess.KNIGHT: 6, chess.BISHOP: 5, chess.ROOK: 7, chess.QUEEN: 5}
 
 # KX-vs-K mate driver (centipawns). Only active when one side is a bare king: push the
 # lone king off the centre toward a corner, and march the winning king up to support the
@@ -248,7 +244,7 @@ KING_ATTACK_UNIT = {
     chess.ROOK: 4,
     chess.QUEEN: 5,
 }
-KING_DANGER_SCALE = 61  # diag-18: policy tune said the multi-attacker ramp was a touch high
+KING_DANGER_SCALE = 65
 KING_DANGER_MAX = 450
 
 _FILE_MASK = [0x0101010101010101 << f for f in range(8)]

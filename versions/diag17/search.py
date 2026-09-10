@@ -102,8 +102,8 @@ _PATH: npt.NDArray[np.uint64] = np.zeros(_MAX_PLY, dtype=np.uint64)  # zobrist k
 # per game resets it for free; tests call _reset_tt(). Two flat uint64 arrays, no
 # per-entry Python objects: an unbounded dict here churns GC and eats the 2 GB budget
 # (docs/PLAN.md, Phase 4). Open-addressed, one probe at slot = key & mask.
-_TT_BITS = 24
-_TT_SIZE = 1 << _TT_BITS  # 16,777,216 slots; 256 MB for the pair (of a 2 GB budget)
+_TT_BITS = 22
+_TT_SIZE = 1 << _TT_BITS  # 4,194,304 slots; 64 MB for the pair of arrays
 _TT_MASK = _TT_SIZE - 1
 _TT_VALUE_MAX = 30_000  # values outside +-this are not stored: they cannot fit the 16-bit
 #                         field and a real eval score never comes near it anyway. This
