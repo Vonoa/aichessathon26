@@ -16,3 +16,15 @@ versions/phase7/raw_positions_carlsen.tsv
 versions/phase7/raw_carlsen_quiet_sample.tsv
 versions/phase7/raw_combined_v2.tsv
 versions/phase7/deduped_combined_v2.tsv
+versions/phase7/gm_pgn/
+versions/phase7/raw_positions_gms.tsv
+versions/phase7/raw_gms_quiet_sample.tsv
+versions/phase7/raw_lichess_quiet_sample_v2.tsv
+versions/phase7/raw_combined_v3.tsv
+versions/phase7/deduped_combined_v3.tsv
+versions/phase7/chunks_v3/
+versions/phase7/chunks_v4/
+versions/phase7/raw_positions_gms2.tsv
+versions/phase7/raw_gms2_quiet_sample.tsv
+versions/phase7/raw_combined_v4.tsv
+versions/phase7/deduped_combined_v4.tsv
