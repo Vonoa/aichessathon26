@@ -27,11 +27,11 @@ from pathlib import Path
 import chess
 import numpy as np
 import numpy.typing as npt
-
-import movegen
 from features import _PIECE_TYPE_INDEX, N_COLORS, N_PIECE_FEATURES, N_SQUARES
 
-_WEIGHTS_PATH = Path(__file__).resolve().parent / "weights.npz"
+import movegen
+
+_WEIGHTS_PATH = Path(__file__).resolve().parent / "weights" / "weights.npz"
 _weights = np.load(_WEIGHTS_PATH)
 W1: npt.NDArray[np.float32] = _weights["fc1_weight"]  # (256, 769)
 B1: npt.NDArray[np.float32] = _weights["fc1_bias"]  # (256,)

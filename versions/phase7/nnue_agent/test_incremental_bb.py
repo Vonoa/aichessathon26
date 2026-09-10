@@ -19,10 +19,10 @@ import random
 
 import chess
 import numpy as np
-
-import movegen
 from features import fen_to_dense_vector
 from nnue_incremental import Accumulator, accumulator_from_scratch, forward
+
+import movegen
 
 _TOL = 1e-4
 
@@ -92,7 +92,7 @@ def play_and_check(start_fen: str, ucis: list[str], label: str) -> None:
     bb2, state2 = movegen.encode(chess.Board(start_fen))
     for code in codes:
         undos.append(movegen._make(bb2, state2, code))
-    for code, undo in zip(reversed(codes), reversed(undos)):
+    for code, undo in zip(reversed(codes), reversed(undos), strict=True):
         movegen._unmake(bb2, state2, code, undo)
         acc.pop()
     if not np.array_equal(bb2, movegen.encode(chess.Board(start_fen))[0]):

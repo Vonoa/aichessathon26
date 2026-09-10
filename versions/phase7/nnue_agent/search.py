@@ -25,9 +25,9 @@ import chess
 import chess.syzygy
 import numpy as np
 import numpy.typing as npt
+from nnue_incremental import Accumulator
 
 import movegen
-from nnue_incremental import Accumulator
 
 _acc = Accumulator()
 
