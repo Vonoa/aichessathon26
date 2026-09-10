@@ -29,7 +29,9 @@ import numpy as np
 import numpy.typing as npt
 from features import _PIECE_TYPE_INDEX, N_COLORS, N_PIECE_FEATURES, N_SQUARES
 
-_WEIGHTS_PATH = Path(__file__).resolve().parent / "weights.npz"
+import movegen
+
+_WEIGHTS_PATH = Path(__file__).resolve().parent / "weights" / "weights.npz"
 _weights = np.load(_WEIGHTS_PATH)
 W1: npt.NDArray[np.float32] = _weights["fc1_weight"]  # (256, 769)
 B1: npt.NDArray[np.float32] = _weights["fc1_bias"]  # (256,)
@@ -78,6 +80,51 @@ def move_deltas(board: chess.Board, move: chess.Move) -> list[tuple[int, int]]:
         rook_to = chess.square(5 if kingside else 3, rank)
         deltas.append((_feature_idx(chess.ROOK, mover.color, rook_from), -1))
         deltas.append((_feature_idx(chess.ROOK, mover.color, rook_to), +1))
+
+    return deltas
+
+
+def move_deltas_bb(
+    bb: npt.NDArray[np.uint64], state: npt.NDArray[np.int64], code: int
+) -> list[tuple[int, int]]:
+    """move_deltas(), for the jitted (bb, state, move-code) substrate current
+    main/search.py runs on instead of chess.Board/chess.Move. `code` is the
+    int32 move encoding from movegen.py (bits 0-5 from, 6-11 to, 12-14 promo
+    [0 none, 1 N, 2 B, 3 R, 4 Q], 15-17 flag [0 normal/capture, 1 double pawn
+    push, 2 en passant, 3 castle]) -- see movegen.py's own docstring. Reuses
+    _feature_idx unchanged: movegen._piece_at already returns piece types in
+    python-chess's own 1..6 numbering, and movegen's colour index (0 White, 1
+    Black) matches board.turn's True/False the same way. Call with bb/state
+    STILL in their pre-move state, same as move_deltas().
+    """
+    frm = code & 0x3F
+    to = (code >> 6) & 0x3F
+    promo = (code >> 12) & 7
+    flag = (code >> 15) & 7
+    mover_idx = int(state[0])
+    enemy_idx = 1 - mover_idx
+    mover_color = chess.WHITE if mover_idx == 0 else chess.BLACK
+    enemy_color = chess.BLACK if mover_idx == 0 else chess.WHITE
+
+    movpt = movegen._piece_at(bb, mover_idx, frm)
+    deltas = [(_feature_idx(movpt, mover_color, frm), -1)]
+
+    if flag == 2:  # en passant
+        cap_sq = to - 8 if mover_idx == 0 else to + 8
+        deltas.append((_feature_idx(chess.PAWN, enemy_color, cap_sq), -1))
+    else:
+        cappt = movegen._piece_at(bb, enemy_idx, to)
+        if cappt != 0:
+            deltas.append((_feature_idx(cappt, enemy_color, to), -1))
+
+    new_pt = (promo + 1) if promo != 0 else movpt
+    deltas.append((_feature_idx(new_pt, mover_color, to), +1))
+
+    if flag == 3:  # castle
+        rook_from = movegen._rook_hop_from(to)
+        rook_to = movegen._rook_hop_to(to)
+        deltas.append((_feature_idx(chess.ROOK, mover_color, rook_from), -1))
+        deltas.append((_feature_idx(chess.ROOK, mover_color, rook_to), +1))
 
     return deltas
 
@@ -152,3 +199,27 @@ class Accumulator:
         search.py already expects from evaluate.evaluate(board)."""
         cp = score_to_centipawns(self.evaluate())
         return cp if board.turn == chess.WHITE else -cp
+
+    def push_bb(self, bb: npt.NDArray[np.uint64], state: npt.NDArray[np.int64], code: int) -> None:
+        """Same contract as push(), for the jitted (bb, state) substrate current
+        main/search.py runs on: call with bb/state STILL in their pre-move state,
+        immediately before movegen._make(bb, state, code)."""
+        deltas = move_deltas_bb(bb, state, code)
+        stm_sign = 1 if int(state[0]) == 0 else -1  # turn flips after this push
+        parent = self._stack[self._ply]
+        self._ply += 1
+        child = self._stack[self._ply]
+        child[:] = parent
+        for idx, sign in deltas:
+            if sign > 0:
+                child += W1[:, idx]
+            else:
+                child -= W1[:, idx]
+        child += stm_sign * W1[:, _STM_FEATURE]
+
+    def evaluate_cp_bb(self, state: npt.NDArray[np.int64]) -> int:
+        """evaluate_cp(), for the jitted (bb, state) substrate: state[0] == 0
+        means White to move (movegen's own convention), same as board.turn ==
+        chess.WHITE."""
+        cp = score_to_centipawns(self.evaluate())
+        return cp if int(state[0]) == 0 else -cp
