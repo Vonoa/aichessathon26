@@ -10,6 +10,7 @@ import pytest
 
 import agent
 import evaluate
+import movegen
 import search
 
 
@@ -68,48 +69,228 @@ def test_is_deterministic() -> None:
     assert first == second
 
 
-def test_seen_position_is_a_draw_at_the_horizon() -> None:
-    # Regression (Phase 3b): a position already seen in the game must score as a draw even
-    # at depth 0, not be evaluated by material. With contempt (5f) a draw is not exactly 0.
-    board = chess.Board("8/8/8/4k3/8/8/3RK3/8 w - - 10 40")  # white is up a whole rook
-    search._seen = frozenset({board._transposition_key()})
+def _negamax_fen(fen: str, depth: int, ply: int) -> int:
+    board = chess.Board(fen)
+    bb, state = movegen.encode(board)
+    search._PATH[:4] = 0
+    return search._negamax(bb, state, depth, ply, -search.MATE, search.MATE, time.monotonic() + 5)
+
+
+def _qsearch_fen(fen: str, ply: int, qply: int = 0) -> int:
+    bb, state = movegen.encode(chess.Board(fen))
+    lo, hi = -search.MATE - 1, search.MATE + 1
+    return search._qsearch(bb, state, ply, lo, hi, time.monotonic() + 5, qply)
+
+
+def _code_of(board: chess.Board, uci: str) -> int:
+    import numpy as np
+
+    bb, state = movegen.encode(board)
+    out = np.empty(256, dtype=np.int32)
+    n = movegen._gen_legal(bb, state, out)
+    want = chess.Move.from_uci(uci)
+    for i in range(n):
+        if movegen.decode_move(int(out[i])) == want:
+            return int(out[i])
+    raise AssertionError(uci)
+
+
+def test_see_static_exchange_evaluation() -> None:
+    cases = [
+        ("4k3/8/8/3p4/8/8/8/3RK3 w - - 0 1", "d1d5", 100),      # win an undefended pawn
+        ("4k3/8/2p5/3p4/8/8/8/3RK3 w - - 0 1", "d1d5", -400),   # rook for a defended pawn
+        ("4k3/3r4/8/3r4/8/8/8/3RK3 w - - 0 1", "d1d5", 0),      # RxR, RxR -- level
+        ("3rk3/8/8/3p4/8/8/3R4/3RK3 w - - 0 1", "d2d5", 100),   # x-ray: doubled rooks
+        ("4k3/8/8/2pP4/8/8/8/4K3 w - c6 0 1", "d5c6", 100),     # en passant
+    ]
+    for fen, uci, want in cases:
+        board = chess.Board(fen)
+        turn = 0 if board.turn == chess.WHITE else 1
+        assert movegen._see(movegen.encode(board)[0], turn, _code_of(board, uci)) == want, fen
+
+
+def test_has_non_pawn_material() -> None:
+    bb, _ = movegen.encode(chess.Board())
+    assert search._has_non_pawn_material(bb, 0) and search._has_non_pawn_material(bb, 1)
+    bb, _ = movegen.encode(chess.Board("8/5k2/8/8/8/3K4/4P3/8 w - - 0 1"))  # K+P vs K
+    assert not search._has_non_pawn_material(bb, 0)
+    assert not search._has_non_pawn_material(bb, 1)
+
+
+def test_null_move_pruning_cuts_nodes() -> None:
+    # White is a clean knight up with a full board: the null search fails high all over
+    # the tree, so NMP prunes. (A near-equal position makes NMP's saving too fragile to
+    # assert -- an eval tweak can flip it, as the king-safety bump did.)
+    board = chess.Board("r2q1rk1/pp2bppp/2n1b3/3p4/3P4/2NBPN2/PP3PPP/R2Q1RK1 w - - 0 11")
+    far = time.monotonic() + 120
+    window = (-search.MATE - 1, search.MATE + 1)
+
+    def run(depth: int) -> tuple[int, int]:
+        search._reset_tt()
+        search._killers[:] = [0] * search._KILLER_SLOTS
+        search._hist[:] = [0] * 4096
+        search._tt_gen = (search._tt_gen + 1) & 0xFFFF
+        search._nodes = 0
+        bb, state = movegen.encode(board)
+        _, sc = search._search_root(bb, state, depth, far, 0, *window)
+        return sc, search._nodes
+
+    # Hold the other two pruners out so this isolates NMP -- with futility + RFP live,
+    # they already thin the frontier enough that NMP's marginal saving can go negative.
+    saved_rfp, saved_fut = search._RFP_MAX_DEPTH, search._FUTILITY_MAX_DEPTH
+    search._RFP_MAX_DEPTH = 0
+    search._FUTILITY_MAX_DEPTH = 0
     try:
-        even = search._negamax(board, 0, 0, -search.MATE, search.MATE, time.monotonic() + 5)
-        odd = search._negamax(board, 0, 1, -search.MATE, search.MATE, time.monotonic() + 5)
+        with_score, with_nodes = run(6)
+        saved = search._NMP_MIN_DEPTH
+        search._NMP_MIN_DEPTH = 99
+        try:
+            without_score, without_nodes = run(6)
+        finally:
+            search._NMP_MIN_DEPTH = saved
+    finally:
+        search._RFP_MAX_DEPTH, search._FUTILITY_MAX_DEPTH = saved_rfp, saved_fut
+    assert abs(with_score - without_score) <= search._CONTEMPT
+    assert with_nodes < without_nodes
+
+
+def test_reverse_futility_prunes_nodes() -> None:
+    # White is up a rook and three pawns; the static eval clears beta by miles at
+    # shallow interior nodes, so reverse-futility fails them high without searching.
+    board = chess.Board("4k3/7p/8/8/8/8/PPP5/1K1R4 w - - 0 1")
+    far = time.monotonic() + 120
+    window = (-search.MATE - 1, search.MATE + 1)
+
+    def run() -> tuple[int, int]:
+        search._reset_tt()
+        search._killers[:] = [0] * search._KILLER_SLOTS
+        search._hist[:] = [0] * 4096
+        search._tt_gen = (search._tt_gen + 1) & 0xFFFF
+        search._nodes = 0
+        bb, state = movegen.encode(board)
+        _, sc = search._search_root(bb, state, 6, far, 0, *window)
+        return sc, search._nodes
+
+    with_score, with_nodes = run()
+    saved = search._RFP_MAX_DEPTH
+    search._RFP_MAX_DEPTH = 0  # _negamax never reaches the block with depth <= 0
+    try:
+        without_score, without_nodes = run()
+    finally:
+        search._RFP_MAX_DEPTH = saved
+    assert with_score > 300 and without_score > 300  # the win survives the pruning
+    assert with_nodes < without_nodes
+
+
+def test_futility_prunes_quiet_frontier_moves() -> None:
+    # White is a rook and four pawns down; at the frontier its quiet king shuffles are
+    # a full margin below alpha and cannot raise it, so futility pruning skips them.
+    board = chess.Board("4k3/7p/8/8/8/8/ppp5/1K1r4 w - - 0 1")
+    far = time.monotonic() + 120
+    window = (-search.MATE - 1, search.MATE + 1)
+
+    def run() -> tuple[int, int]:
+        search._reset_tt()
+        search._killers[:] = [0] * search._KILLER_SLOTS
+        search._hist[:] = [0] * 4096
+        search._tt_gen = (search._tt_gen + 1) & 0xFFFF
+        search._nodes = 0
+        bb, state = movegen.encode(board)
+        _, sc = search._search_root(bb, state, 6, far, 0, *window)
+        return sc, search._nodes
+
+    with_score, with_nodes = run()
+    saved = search._FUTILITY_MAX_DEPTH
+    search._FUTILITY_MAX_DEPTH = 0  # _negamax never reaches the block with depth <= 0
+    try:
+        without_score, without_nodes = run()
+    finally:
+        search._FUTILITY_MAX_DEPTH = saved
+    assert with_score < -300 and without_score < -300  # still losing, pruning didn't lie
+    assert with_nodes < without_nodes
+
+
+def test_late_move_reductions_cut_nodes() -> None:
+    # A wide, level middlegame: the log-formula reduction searches the tail of the
+    # quiet list shallower, so far fewer nodes for a score the re-search keeps honest.
+    board = chess.Board("r1bq1rk1/ppp2ppp/2np1n2/2b1p3/2B1P3/2NP1N2/PPP2PPP/R1BQ1RK1 w - - 0 7")
+    far = time.monotonic() + 120
+    window = (-search.MATE - 1, search.MATE + 1)
+
+    def run() -> tuple[int, int]:
+        search._reset_tt()
+        search._killers[:] = [0] * search._KILLER_SLOTS
+        search._hist[:] = [0] * 4096
+        search._tt_gen = (search._tt_gen + 1) & 0xFFFF
+        search._nodes = 0
+        bb, state = movegen.encode(board)
+        _, sc = search._search_root(bb, state, 7, far, 0, *window)
+        return sc, search._nodes
+
+    with_score, with_nodes = run()
+    saved = search._LMR_MIN_DEPTH
+    search._LMR_MIN_DEPTH = 99  # disables the `reduce` gate; every move searched full depth
+    try:
+        without_score, without_nodes = run()
+    finally:
+        search._LMR_MIN_DEPTH = saved
+    assert abs(with_score - without_score) <= 2 * search._CONTEMPT
+    assert with_nodes < without_nodes
+
+
+def test_seen_position_is_a_draw_at_the_horizon() -> None:
+    # A position already seen in the game must score as a draw even at the horizon, not
+    # be evaluated by material. With contempt a draw is not exactly 0.
+    board = chess.Board("8/8/8/4k3/8/8/3RK3/8 w - - 10 40")  # white is up a whole rook
+    search._seen = frozenset({movegen.zobrist(board)})
+    try:
+        even = _negamax_fen(board.fen(), 0, 0)
+        odd = _negamax_fen(board.fen(), 0, 1)
     finally:
         search._seen = frozenset()
     assert even == -search._CONTEMPT
     assert odd == search._CONTEMPT
 
 
+def test_fifty_move_fade_dampens_a_stale_advantage() -> None:
+    # White up a rook. Below the fade threshold the eval is untouched; once the halfmove
+    # clock climbs the same position is worth meaningfully less, so the search is pushed
+    # to convert with a zeroing move before the draw claim (Round 97).
+    won = "8/8/8/4k3/8/8/3RK3/8 w - - {} 40"
+    fresh = search._eval_bb(*movegen.encode(chess.Board(won.format(0))))
+    early = search._eval_bb(*movegen.encode(chess.Board(won.format(search._FIFTY_FADE_START))))
+    stale = search._eval_bb(*movegen.encode(chess.Board(won.format(90))))
+    assert fresh > 400
+    assert early == fresh                 # threshold not yet crossed
+    assert stale < fresh * 3 // 5         # ~0.45x near the claim
+    assert stale > 100                    # still clearly winning, just discounted
+
+
 def test_qsearch_resolves_a_hanging_piece() -> None:
     # White's rook can take Black's undefended rook. Static eval sees material equal;
     # quiescence must see the win.
-    board = chess.Board("4k3/8/8/8/8/3r4/3R4/4K3 w - - 0 1")
-    q = search._qsearch(board, 0, -search.MATE, search.MATE, time.monotonic() + 5)
+    fen = "4k3/8/8/8/8/3r4/3R4/4K3 w - - 0 1"
+    q = _qsearch_fen(fen, 0)
     assert q >= 450
-    assert q > evaluate.evaluate(board)
+    assert q > evaluate.evaluate(chess.Board(fen))
 
 
 def test_qsearch_leaves_a_quiet_position_at_the_static_eval() -> None:
-    board = chess.Board("4k3/8/8/8/4P3/8/8/4K3 w - - 0 1")  # nothing to capture, no check
-    q = search._qsearch(board, 0, -search.MATE, search.MATE, time.monotonic() + 5)
-    assert q == evaluate.evaluate(board)
+    fen = "4k3/8/8/8/4P3/8/8/4K3 w - - 0 1"  # nothing to capture, no check
+    assert _qsearch_fen(fen, 0) == evaluate.evaluate(chess.Board(fen))
 
 
 def test_qsearch_follows_a_quiet_check_to_win_material() -> None:
-    # White is down a queen for a knight, but Nf4+ forks the king and the queen. There is
-    # no capture in the position, so a captures-only quiescence just stands pat here;
-    # following one ply of quiet checks finds the fork and swings the score back.
-    board = chess.Board("r7/8/4k1q1/8/8/3N4/6PP/1R4K1 w - - 0 1")
-    deadline = time.monotonic() + 5
-    stand_pat = evaluate.evaluate(board)
-    q = search._qsearch(board, 1, -search.MATE - 1, search.MATE + 1, deadline)
-    assert stand_pat < -300  # really is down material before the tactic
-    assert q > stand_pat + 400  # the quiet check is searched and the fork is found
+    # White is down a queen for a knight, but Nf4+ forks the king and the queen. No
+    # capture in the position, so a captures-only quiescence just stands pat; following
+    # one ply of quiet checks finds the fork and swings the score back. Black keeps a
+    # g7 pawn so White's g2/h2 aren't scored as passed (which would muddy stand_pat).
+    fen = "r7/6p1/4k1q1/8/8/3N4/6PP/1R4K1 w - - 0 1"
+    stand_pat = evaluate.evaluate(chess.Board(fen))
+    assert stand_pat < -300
+    assert _qsearch_fen(fen, 1) > stand_pat + 400
     # With the check window exhausted (qply past _QS_CHECK_PLIES) it reverts to stand-pat.
-    no_checks = search._qsearch(board, 1, -search.MATE - 1, search.MATE + 1, deadline, 9)
-    assert no_checks == stand_pat
+    assert _qsearch_fen(fen, 1, 9) == stand_pat
 
 
 def test_tt_entry_round_trips() -> None:
@@ -142,19 +323,20 @@ def test_tt_persists_across_moves_and_cuts_nodes() -> None:
     # nodes. The move can differ between equal-scored choices, so don't assert on it.
     board = chess.Board("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3")
     far = time.monotonic() + 120
-    first_move = next(iter(board.legal_moves))
-    search._killers[:] = [None] * search._KILLER_SLOTS
+    search._killers[:] = [0] * search._KILLER_SLOTS
     search._hist[:] = [0] * 4096
+    window = (-search.MATE - 1, search.MATE + 1)
 
-    full_window = (-search.MATE - 1, search.MATE + 1)
     search._tt_gen = (search._tt_gen + 1) & 0xFFFF
     search._nodes = 0
-    _, cold_score = search._search_root(board, 4, far, first_move, *full_window)
+    bb, state = movegen.encode(board)
+    _, cold_score = search._search_root(bb, state, 4, far, 0, *window)
     cold_nodes = search._nodes
 
     search._tt_gen = (search._tt_gen + 1) & 0xFFFF
     search._nodes = 0
-    _, warm_score = search._search_root(board, 4, far, first_move, *full_window)
+    bb, state = movegen.encode(board)
+    _, warm_score = search._search_root(bb, state, 4, far, 0, *window)
     warm_nodes = search._nodes
 
     assert warm_score == cold_score
@@ -167,14 +349,12 @@ def test_tt_stores_no_value_it_cannot_encode() -> None:
     # past +-_TT_VALUE_MAX) has to be skipped, never wrapped into the 16-bit field.
     assert search._TT_VALUE_MAX < search._MATE_THRESHOLD  # so mate scores can't be stored
     board = chess.Board("8/6k1/8/8/8/8/1R4K1/8 w - - 0 1")
-    search._killers[:] = [None] * search._KILLER_SLOTS
+    search._killers[:] = [0] * search._KILLER_SLOTS
     search._hist[:] = [0] * 4096
     search._tt_gen = (search._tt_gen + 1) & 0xFFFF
     search._nodes = 0
-    search._search_root(
-        board, 6, time.monotonic() + 120, next(iter(board.legal_moves)),
-        -search.MATE - 1, search.MATE + 1,
-    )
+    bb, state = movegen.encode(board)
+    search._search_root(bb, state, 6, time.monotonic() + 120, 0, -search.MATE - 1, search.MATE + 1)
 
     occupied = search._tt_key != 0
     assert int(occupied.sum()) > 0
@@ -231,19 +411,19 @@ def test_syzygy_converts_a_won_pawn_ending() -> None:
 
 
 def test_cutoff_updates_killers_and_history() -> None:
-    move = chess.Move.from_uci("e2e4")
+    code = chess.E2 | (chess.E4 << 6)  # move code for e2e4 (from | to << 6)
     base = 3 * 2
-    search._killers[base] = None
-    search._killers[base + 1] = None
-    idx = move.from_square * 64 + move.to_square
+    search._killers[base] = 0
+    search._killers[base + 1] = 0
+    idx = chess.E2 * 64 + chess.E4
     before = search._hist[idx]
     try:
-        search._record_cutoff(move, ply=3, depth=5)
-        assert search._killers[base] == move
+        search._record_cutoff(code, ply=3, depth=5)
+        assert search._killers[base] == code
         assert search._hist[idx] == before + 25
     finally:
-        search._killers[base] = None
-        search._killers[base + 1] = None
+        search._killers[base] = 0
+        search._killers[base + 1] = 0
         search._hist[idx] = before
 
 
@@ -281,18 +461,18 @@ def test_eval_is_colour_symmetric(fen: str) -> None:
 # Exact outputs of evaluate() on fixed positions. A pure speed change must not move these.
 # Deliberate eval changes so far: the KX-vs-K entry 540 -> 578 (mate driver, evaluate.
 # _mopup) -> 604 (mop-up weights bumped 10/4 -> 16/8); three middlegame entries shifted
-# +-3 when king safety went non-linear. The symmetric and phase-faded endgame entries
-# stay put, as they should.
+# +-3 when king safety went non-linear; the two pawn-heavy endgame entries moved (-86 ->
+# -66, -383 -> -439) when passed/doubled/isolated were Texel-tuned for diag-10.
 _EVAL_GOLDEN = {
-    "r1bq1rk1/pp2bppp/2n1pn2/2pp4/3P1B2/2PBPN2/PP1N1PPP/R2Q1RK1 w - - 0 9": 66,
+    "r1bq1rk1/pp2bppp/2n1pn2/2pp4/3P1B2/2PBPN2/PP1N1PPP/R2Q1RK1 w - - 0 9": 79,
     "r3k2r/pppq1ppp/2np1n2/2b1p1B1/2B1P1b1/2NP1N2/PPPQ1PPP/R3K2R w KQkq - 0 1": 0,
-    "8/5pk1/6p1/7p/3R3P/6P1/5PK1/3r4 b - - 0 1": 9,
-    "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c6 0 2": 22,
-    "8/2k5/8/8/8/8/5K2/6R1 w - - 0 1": 604,
-    "8/1p3pk1/p5p1/3P4/2P5/6P1/5K2/8 w - - 0 1": -86,
+    "8/5pk1/6p1/7p/3R3P/6P1/5PK1/3r4 b - - 0 1": -5,
+    "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c6 0 2": 26,
+    "8/2k5/8/8/8/8/5K2/6R1 w - - 0 1": 657,
+    "8/1p3pk1/p5p1/3P4/2P5/6P1/5K2/8 w - - 0 1": -66,
     "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N1P/1PP1QPP1/R4RK1 w - - 0 11": -2,
-    "2r3k1/5ppp/p7/1p1Pp3/8/1P3N2/P4PPP/3R2K1 b - - 0 1": -383,
-    "r1b1k2r/ppppqppp/2n2n2/2b5/4P3/2N2N2/PPPP1PPP/R1BQK2R w KQkq - 6 6": -259,
+    "2r3k1/5ppp/p7/1p1Pp3/8/1P3N2/P4PPP/3R2K1 b - - 0 1": -442,
+    "r1b1k2r/ppppqppp/2n2n2/2b5/4P3/2N2N2/PPPP1PPP/R1BQK2R w KQkq - 6 6": -268,
 }
 
 

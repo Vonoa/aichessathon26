@@ -17,7 +17,6 @@ Deterministic by construction: no RNG in the search, move ordering is a stable s
 the generator's fixed order, ties broken by first-seen. Same position + clock -> same move.
 """
 
-import math
 import os
 import time
 
@@ -50,24 +49,6 @@ _RFP_MAX_DEPTH = 6  # reverse-futility pruning only near the frontier
 _RFP_MARGIN = 75  # centipawns per ply the static eval must clear beta by
 _FUTILITY_MAX_DEPTH = 2  # futility-prune quiet moves only at the frontier
 _FUTILITY_MARGIN = 120  # centipawns per ply a quiet move must come within alpha
-
-# Fifty-move-rule damping. Once a line has gone this many plies with no pawn move or
-# capture, the position is drifting toward the draw claim, so its eval is faded toward
-# zero -- linearly, reaching ~0.36x as the halfmove clock nears 100. This makes the
-# search treat aimless shuffling of a won position as a loss of value and steer toward a
-# zeroing move (pawn break, trade) while the edge is still real. Below the threshold the
-# eval is untouched. (Round 97: a +400 rook-up game shuffled straight into a threefold
-# draw -- the eval bled from +399 to -25 over ~18 quiet moves with no course correction.)
-_FIFTY_FADE_START = 30
-
-# Late-move reduction depth by [depth][move_index] (both clamped to 63). The classic
-# log formula -- reduce more the deeper the search and the later the move. The call
-# site shaves one off on the PV and for killers, floors at 0, and caps it so the
-# reduced re-search is always at least one ply (never straight into quiescence).
-_LMR_TABLE: list[list[int]] = [[0] * 64 for _ in range(64)]
-for _d in range(1, 64):
-    for _m in range(1, 64):
-        _LMR_TABLE[_d][_m] = int(0.8 + math.log(_d) * math.log(_m) / 2.5)
 
 # Syzygy endgame tablebases. When the board is down to this few men and ./syzygy holds
 # the files, search_move picks the move straight from the tables (WDL for the outcome,
@@ -111,8 +92,8 @@ _PATH: npt.NDArray[np.uint64] = np.zeros(_MAX_PLY, dtype=np.uint64)  # zobrist k
 # per game resets it for free; tests call _reset_tt(). Two flat uint64 arrays, no
 # per-entry Python objects: an unbounded dict here churns GC and eats the 2 GB budget
 # (docs/PLAN.md, Phase 4). Open-addressed, one probe at slot = key & mask.
-_TT_BITS = 24
-_TT_SIZE = 1 << _TT_BITS  # 16,777,216 slots; 256 MB for the pair (of a 2 GB budget)
+_TT_BITS = 22
+_TT_SIZE = 1 << _TT_BITS  # 4,194,304 slots; 64 MB for the pair of arrays
 _TT_MASK = _TT_SIZE - 1
 _TT_VALUE_MAX = 30_000  # values outside +-this are not stored: they cannot fit the 16-bit
 #                         field and a real eval score never comes near it anyway. This
@@ -168,11 +149,7 @@ def _eval_bb(bb: npt.NDArray[np.uint64], state: npt.NDArray[np.int64]) -> int:
     movegen._occ3(bb, _OCC3)
     wk = movegen._king_sq(bb, 0)
     bk = movegen._king_sq(bb, 1)
-    score = int(_evaluate_jit(bb, _OCC3, wk, bk, int(state[0]) == 0))
-    half = int(state[3])
-    if half > _FIFTY_FADE_START:
-        score = score * max(8, 140 - half) // 110
-    return score
+    return int(_evaluate_jit(bb, _OCC3, wk, bk, int(state[0]) == 0))
 
 
 def _in_check(bb: npt.NDArray[np.uint64], state: npt.NDArray[np.int64]) -> bool:
@@ -465,20 +442,7 @@ def _negamax(
                 and move_index >= _LMR_MIN_MOVE
                 and not gives_check
             )
-            if reduce:
-                # conditional expressions, not min(): a builtin call per reduced move
-                # is ~15% of a cheap endgame node (see tools/bench.py rook endgame).
-                di = depth if depth < 64 else 63
-                mi = move_index if move_index < 64 else 63
-                r = _LMR_TABLE[di][mi]
-                if beta - alpha > 1:  # on the PV, reduce one less
-                    r -= 1
-                if r < 1:
-                    r = 0
-                elif r > depth - 2:
-                    r = depth - 2
-            else:
-                r = 0
+            r = (2 if move_index >= _LMR_MIN_MOVE + 3 else 1) if reduce else 0
             score = -_negamax(bb, state, depth - 1 - r, ply + 1, -alpha - 1, -alpha, deadline)
             if score > alpha and (r > 0 or score < beta):
                 score = -_negamax(bb, state, depth - 1, ply + 1, -beta, -alpha, deadline)

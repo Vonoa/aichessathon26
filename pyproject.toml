@@ -51,7 +51,7 @@ known-first-party = ["agent", "search", "evaluate"]
 
 [tool.mypy]
 strict = true
-files = ["agent.py", "search.py", "evaluate.py"]  # harness/ is upstream's and now has OS-specific code
+files = ["agent.py", "search.py", "evaluate.py", "movegen.py"]  # harness/ is upstream's and now has OS-specific code
 
 [[tool.mypy.overrides]]
 module = ["numba", "numba.*"]  # numba ships no type stubs

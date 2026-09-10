@@ -233,16 +233,13 @@ SEMI_OPEN_FILE_PENALTY = -12
 #   0 or 1 attacker -> -danger            (a lone piece is easily met)
 #   2+ attackers    -> -min(MAX, danger^2 * SCALE // 100)
 # so danger ramps quadratically with the number of pieces piling on, capped near a rook.
-# diag-17: rook 5->4, queen 7->5. The GM-move policy tune (tools/policy_tune.py, 3
-# settings, 32k games) consistently said the attacker units were too high -- the eval
-# over-values piling pieces near a king / over-fears them near its own. Conservative
-# slice of the tune's "halve them" (which smelled of collapse); gauntlet-checked.
+# All first-guess values -- the arena calibrates them.
 KING_ATTACK_UNIT = {
     chess.PAWN: 2,
     chess.KNIGHT: 3,
     chess.BISHOP: 3,
-    chess.ROOK: 4,
-    chess.QUEEN: 5,
+    chess.ROOK: 5,
+    chess.QUEEN: 7,
 }
 KING_DANGER_SCALE = 65
 KING_DANGER_MAX = 450

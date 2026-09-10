@@ -381,3 +381,80 @@ board is down to `_TB_MAX_PIECES` (5) men or fewer and the files are present,
   engine silently falls back to search.
 - Gate + arena vs `versions/phase5jit` pending. `make gate` skips the syzygy tests if
   `search._tablebase is None`.
+
+### 2026-09-08 -- Jitted move generator, Phase A (branch `jit-movegen`)
+
+`movegen.py`: a numba-jitted bitboard generator, built and validated on its own before
+it touches `search.py` (docs/PLAN.md Phase 3 -- "the hardest phase"; a movegen bug is a
+lost game).
+
+- Representation: `bb` uint64[2,6] (same layout as `evaluate._encode`) + `state` int64[4]
+  `[turn, castling, ep, halfmove]`. Moves packed into int32 (`from | to<<6 | promo<<12 |
+  flag<<15`, flag = normal / double-push / en-passant / castle).
+- Jitted: `_gen` (pseudo-legal), `_make` / `_unmake` (in place, undo word), `_attacked_by`
+  (occupancy-parametrised), `_gen_legal` (gen + king-safety filter), `_perft`.
+- **Validated:** perft matches the published numbers for all six standard positions
+  (initial d5 4,865,609; Kiwipete d4 4,085,603; positions 3-6) *and* python-chess's own
+  counts. The legal-move SET matches python-chess move-for-move over 21,307 positions
+  from 600 pseudo-random games -- zero mismatches (castling, en passant, promotions
+  included).
+- **Speed:** ~4.4-5.2M nps for jitted perft vs python-chess's ~0.26M -- ~17x at the raw
+  gen + make + legality + unmake work.
+- Cost: the numba compile of `_gen` / `_gen_legal` is ~22 s at import (`_perft` is not
+  warmed -- validation only). Fits the 90 s init budget with room; `cache=False` because
+  `/tmp` is wiped per game.
+- Tests: `tests/test_movegen.py` (perft to d3-d4, legal-set divergence, encode round
+  trip). `movegen.py` added to the mypy files list.
+- **Not integrated.** Phase B decides how deep to wire it into the search -- the real
+  win needs the search to carry a lightweight board the whole way down, not push/pop a
+  chess.Board per node.
+
+### 2026-09-08 -- Jitted move generator wired into the search, Phase B (branch `jit-movegen`)
+
+The search now runs on `movegen.py`'s bitboard board: `(bb, state)` numpy arrays,
+`_gen_legal` / `_make` / `_unmake` in place of `board.legal_moves` / `push` / `pop`,
+`_zobrist` for the TT and repetition keys, `_attacked_by` for check detection, and
+`evaluate._evaluate_jit` read straight off `bb`. A `chess.Board` is touched only at the
+root -- parse the FEN, probe Syzygy, format the UCI reply. `agent.py` keys `_history` by
+`movegen.zobrist`.
+
+- **Sub-steps, each validated:** eval bridge == `evaluate.evaluate` over 8,432 positions
+  (0 mismatch); Zobrist transposition-consistent + make/unmake round-trips + deterministic;
+  search score == old python-chess search on **561/562 positions at fixed depth 3**
+  (worst gap 31 cp, the known LMR-fail-soft ordering effect). Move matches 69% -- the
+  rest are equal-value alternatives (the generator's move order differs from
+  python-chess's, so the stable-sort tie-break picks differently).
+- **Speed: ~2.4x nps, +1-2 plies.** Bench: open middlegame d3->d4 (~22k->49k nps),
+  sharp middlegame d3->d5 (~25k->60k), rook endgame d7->d8 (~30k->74k). Base node cost
+  ~40 us -> ~15 us.
+- `search.warm_up()` runs one tiny search at import so numba compiles the whole path in
+  the ~14 s import, not on move one. First real move: d3 in 188 ms, no compile stall.
+- `_insufficient` is a coarse jitted check (KvK, K+minor vs K); same-colour KBvKB and
+  KNNvK fall through to the eval / repetition -- rare, never a blunder.
+- Tests: the six search-internal tests rewritten to the `(bb, state)` interface; gate
+  green (245 pass, 1 xfail).
+- **Still open:** SEE / NMP un-parked on the fast substrate (both should flip positive
+  now); a full arena vs `versions/phase5jit` + `make zip` smoke before any upload;
+  `docs/ENGINE.md` / `PLAN.md` describe the old python-chess search and need a rewrite.
+
+### 2026-09-08 -- SEE + null-move pruning on the jitted substrate (branch `jit-movegen`)
+
+Both were parked at ~break-even on the old python-chess search (a node was ~40 us so the
+per-node cost swallowed the pruning). Re-added now that a node is ~15 us.
+
+- **NMP.** In `_negamax` after the TT probe: not in check, `depth >= _NMP_MIN_DEPTH` (3),
+  beta not a mate score, side to move has a piece (`_has_non_pawn_material` -- the
+  zugzwang guard), and static eval already `>= beta`. Flip `state[0]`/ep, search
+  `depth - 1 - r` (r = 3 at depth >= 6 else 2) zero-window at beta; a fail-high prunes.
+- **SEE.** `movegen._see(bb, turn, code)` -- a jitted static exchange evaluation with
+  x-ray, `_attackers_to` off the ray tables. Quiescence drops a non-promo capture whose
+  SEE is worse than `-_SEE_QS_MARGIN` (90), unless it captures equal-or-up (structurally
+  safe, skip the call) or gives check.
+- **Bench, isolated:** NMP alone takes the rook endgame d8 -> d10 at no nps cost (it
+  finally pays -- reaches the depth where R=3 compounds). SEE alone is ~3% nps, no bench
+  depth change (its value is tactical -- not misevaluating a losing-capture line). Both
+  together: open middlegame d4 -> d5, rook d8 -> d10, sharp unchanged; overall nps
+  64k -> 60k.
+- SEE unit-tested (undefended / defended / x-ray / en passant); NMP tested to cut nodes
+  without changing the score; `_has_non_pawn_material` tested. Gate green (249 pass).
+- Arena vs `versions/phase5jit` pending, then the rated ladder.
