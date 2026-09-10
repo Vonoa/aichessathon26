@@ -61,7 +61,7 @@ _FUTILITY_MARGIN = 120  # centipawns per ply a quiet move must come within alpha
 # diag-21: lowered 30 -> 16. Round 104 bled a +230 into a threefold *through* trades --
 # a capture every 2-3 moves kept the halfmove clock under ~15, so the fade never engaged
 # until the position was already dead. 16 plies of quiet play is enough to start dimming.
-_FIFTY_FADE_START = 16
+_FIFTY_FADE_START = 10
 
 # Late-move reduction depth by [depth][move_index] (both clamped to 63). The classic
 # log formula -- reduce more the deeper the search and the later the move. The call
@@ -175,7 +175,7 @@ def _eval_bb(bb: npt.NDArray[np.uint64], state: npt.NDArray[np.int64]) -> int:
     half = int(state[3])
     if half > _FIFTY_FADE_START:
         over = half - _FIFTY_FADE_START  # quiet plies past the threshold
-        score = score * max(20, 100 - over) // 100  # ~1% eval per quiet ply, floor 0.20x
+        score = score * max(20, 100 - over * 2) // 100  # diag-21f: 2%/ply
     return score
 
 

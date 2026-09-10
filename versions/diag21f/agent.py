@@ -10,7 +10,7 @@ import search
 
 # Bump this on every upload. It prints once at import, so the per-game log the platform
 # keeps names exactly which build played that game.
-BUILD = "diag-21 earlier fade (16 plies)"
+BUILD = "diag-21f fast fade (10, 2pct)"
 print(f"agent build: {BUILD}", flush=True)
 
 # Import time runs once per game, inside a 90 second budget, before your clock starts.

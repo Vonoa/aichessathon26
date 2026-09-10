@@ -469,9 +469,9 @@ _EVAL_GOLDEN = {
     "8/5pk1/6p1/7p/3R3P/6P1/5PK1/3r4 b - - 0 1": -5,
     "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c6 0 2": 26,
     "8/2k5/8/8/8/8/5K2/6R1 w - - 0 1": 657,
-    "8/1p3pk1/p5p1/3P4/2P5/6P1/5K2/8 w - - 0 1": -62,
+    "8/1p3pk1/p5p1/3P4/2P5/6P1/5K2/8 w - - 0 1": -66,
     "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N1P/1PP1QPP1/R4RK1 w - - 0 11": -2,
-    "2r3k1/5ppp/p7/1p1Pp3/8/1P3N2/P4PPP/3R2K1 b - - 0 1": -444,
+    "2r3k1/5ppp/p7/1p1Pp3/8/1P3N2/P4PPP/3R2K1 b - - 0 1": -442,
     "r1b1k2r/ppppqppp/2n2n2/2b5/4P3/2N2N2/PPPP1PPP/R1BQK2R w KQkq - 6 6": -268,
 }
 

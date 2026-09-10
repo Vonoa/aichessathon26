@@ -31,7 +31,7 @@ from evaluate import _evaluate_jit
 
 MATE = 1_000_000
 _MATE_THRESHOLD = MATE - 1_000  # a score past this is a forced mate
-_CONTEMPT = 25  # a draw scores this many centipawns below equal, so the engine plays to win
+_CONTEMPT = 40  # diag-21c: harder draw aversion, measured not shipped
 _RESERVE_MS = 500  # keep at least this on the clock; the watchdog does not forgive
 _CHECK_INTERVAL = 255  # test the wall clock once per this many nodes
 _MAX_DEPTH = 64
